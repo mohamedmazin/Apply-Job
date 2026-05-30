@@ -3,24 +3,17 @@ import pickle
 import re
 import os
 from typing import List, Optional, Dict, Any
-from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import fitz
 import nltk
 from nltk.corpus import stopwords
 from sentence_transformers import SentenceTransformer, util
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text, Float
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
 import uvicorn
 import io
-
-# تحميل المتغيرات من .env
-load_dotenv()
 
 # تحميل NLTK data
 try:
@@ -39,62 +32,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- إعدادات قاعدة البيانات (SQL Server) ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    DATABASE_URL = "mssql+pyodbc:///?odbc_connect=DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost;DATABASE=hiring;UID=sa;PWD=your_password"  # مثال
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# --- نماذج قاعدة البيانات (JobPosts و JobApplications الحالية) ---
-class JobPostDB(Base):
-    __tablename__ = "JobPosts"  # اسم الجدول الحالي
-    
-    # أضف الأعمدة اللي عندك في جدول JobPosts
-    # مثال بناءً على الصور اللي شفتها قبل كدا
-    id = Column(Integer, primary_key=True, index=True)
-    Title = Column(String(255), nullable=False)
-    JobType = Column(String(100))
-    CompanyName = Column(String(255))
-    Description = Column(Text)
-    Location = Column(String(255))
-    MinSalary = Column(Float)
-    MaxSalary = Column(Float)
-    MinAge = Column(Integer)
-    MaxAge = Column(Integer)
-    ExperienceLevel = Column(String(100))  # "Entry", "Mid", "Senior"
-    # أضف باقي الأعمدة اللي عندك هنا...
-
-class JobApplicationDB(Base):
-    __tablename__ = "JobApplications"  # اسم الجدول الحالي
-    
-    # أضف الأعمدة اللي عندك في جدول JobApplications
-    id = Column(Integer, primary_key=True, index=True)
-    Age = Column(Integer)
-    YearsOfExperience = Column(Integer)
-    AvailableStartDate = Column(String(255))
-    MinExpectedSalary = Column(Float)
-    MaxExpectedSalary = Column(Float)
-    CoverLetter = Column(Text)
-    SeekerTitle = Column(String(255))
-    Address = Column(String(255))
-    SkillsExtracted = Column(Text)
-    HighestEducation = Column(Text)
-    EducationDetailsExtracted = Column(Text)
-    # أضف باقي الأعمدة اللي عندك هنا...
-
-# --- لم نعد نحتاج نعمل create tables لانه الجداول موجودة فعلاً ---
-
-# Dependency للجلسة
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 # --- المتغيرات العالمية للنموذج ---
 MODEL = None
@@ -128,23 +65,22 @@ TECH_JOB_MAPPING = {
 
 # --- نماذج Pydantic للطلبات والاستجابات ---
 class CandidateData(BaseModel):
-    Age: Optional[int] = 25
-    YearsOfExperience: Optional[int] = 0
-    Address: Optional[str] = ""
-    SkillsExtracted: Optional[str] = ""
-    HighestEducation: Optional[str] = ""
-    EducationDetailsExtracted: Optional[str] = ""
-    FullText: str = ""  # نستخدم ده للنص الكامل للـ CV
+    age: Optional[int] = 25
+    years_of_experience: Optional[int] = 0
+    address: Optional[str] = ""
+    skills_extracted: Optional[str] = ""
+    highest_education: Optional[str] = ""
+    education_details_extracted: Optional[str] = ""
+    full_text: str = ""
 
 class JobPostData(BaseModel):
-    id: Optional[int] = None
-    Title: str
-    Description: Optional[str] = ""
-    Location: Optional[str] = ""
-    MinAge: Optional[int] = 18
-    MaxAge: Optional[int] = 60
-    ExperienceLevel: Optional[str] = "Entry"
-    # أضف باقي الحقول اللي عندك هنا...
+    title: str
+    description: Optional[str] = ""
+    location: Optional[str] = ""
+    min_age: Optional[int] = 18
+    max_age: Optional[int] = 60
+    experience_level: Optional[str] = "Entry"  # Entry/Mid/Senior
+    required_skills: Optional[str] = ""
 
 class MatchScoreResponse(BaseModel):
     final_score: float
@@ -164,8 +100,7 @@ class RankedApplicant(BaseModel):
     years_of_experience: Optional[int] = 0
 
 class RankingRequest(BaseModel):
-    job_post_id: Optional[int] = None
-    job_post: Optional[JobPostData] = None
+    job_post: JobPostData
     applicants: List[CandidateData]
 
 # --- تحويل ExperienceLevel إلى رقم ---
@@ -212,13 +147,13 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
     education = get_section(["Education", "Academic", "Qualifications"])
 
     return {
-        "Age": final_age,
-        "YearsOfExperience": final_exp,
-        "Address": address,
-        "SkillsExtracted": skills,
-        "HighestEducation": education.split('\n')[0] if education else "",
-        "EducationDetailsExtracted": education,
-        "FullText": text
+        "age": final_age,
+        "years_of_experience": final_exp,
+        "address": address,
+        "skills_extracted": skills,
+        "highest_education": education.split('\n')[0] if education else "",
+        "education_details_extracted": education,
+        "full_text": text
     }
 
 def load_models():
@@ -240,28 +175,30 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     model, sbert_model = load_models()
     
     # 1. التشابه الدلالي (SBERT)
-    job_text = deep_clean_text(job_post.Title + " " + (job_post.Description or "") + " ")  # أضف مهارات لو عندك
-    cv_text_combined = deep_clean_text((candidate.SkillsExtracted or "") + " " + (candidate.EducationDetailsExtracted or "") + " " + (candidate.FullText or ""))
+    job_text = deep_clean_text(job_post.title + " " + (job_post.description or "") + " " + (job_post.required_skills or ""))
+    cv_text_combined = deep_clean_text((candidate.skills_extracted or "") + " " + (candidate.education_details_extracted or "") + " " + (candidate.full_text or ""))
     
     cv_emb = sbert_model.encode(cv_text_combined, convert_to_tensor=True)
     job_emb = sbert_model.encode(job_text, convert_to_tensor=True)
     semantic_sim = util.cos_sim(cv_emb, job_emb).item()
 
     # 2. مطابقة الكلمات المفتاحية للعنوان
-    target_role = job_post.Title.lower()
+    target_role = job_post.title.lower()
     clean_title = re.sub(r'[\(\)/]', ' ', target_role)
     title_keywords = [w for w in clean_title.split() if len(w) > 2 and w not in ["and", "the", "for"]]
     
-    title_match_count = sum(1 for kw in title_keywords if kw in (candidate.FullText or "").lower() or kw in (candidate.SkillsExtracted or "").lower())
+    title_match_count = sum(1 for kw in title_keywords if kw in (candidate.full_text or "").lower() or kw in (candidate.skills_extracted or "").lower())
     title_match_ratio = title_match_count / len(title_keywords) if title_keywords else 1.0
     
-    # 3. مطابقة المهارات (لو عندك عمود RequiredSkills في JobPosts)
-    skill_ratio = 0.5  # قيمة افتراضية، أضف منطقك هنا لو عندك المهارات في JobPosts
+    # 3. مطابقة المهارات
+    req_skills = set([s.strip().lower() for s in (job_post.required_skills or "").split(',') if s.strip()])
+    cv_skills_set = set(deep_clean_text(candidate.skills_extracted or "").split())
+    skill_ratio = len(cv_skills_set.intersection(req_skills)) / len(req_skills) if req_skills else 0.5
 
     # 4. مطابقة العمر (Range)
-    age = candidate.Age or 25
-    min_age = job_post.MinAge or 18
-    max_age = job_post.MaxAge or 60
+    age = candidate.age or 25
+    min_age = job_post.min_age or 18
+    max_age = job_post.max_age or 60
     if min_age <= age <= max_age:
         age_match_score = 1.0
     elif age < min_age:
@@ -270,13 +207,13 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         age_match_score = max(0, 1 - (age - max_age) / 10)
 
     # 5. مطابقة الخبرة
-    exp_candidate = candidate.YearsOfExperience or 0
-    exp_required = experience_level_to_years(job_post.ExperienceLevel or "Entry")
+    exp_candidate = candidate.years_of_experience or 0
+    exp_required = experience_level_to_years(job_post.experience_level or "Entry")
     exp_diff = exp_candidate - exp_required
     experience_match_score = max(0, min(1.0, 0.5 + exp_diff / 5))
 
     # 6. التنبؤ باستخدام النموذج
-    selected_title = job_post.Title
+    selected_title = job_post.title
     mapped_title = TECH_JOB_MAPPING.get(selected_title, selected_title)
     job_cat = TRAINED_JOB_CATEGORIES.index(mapped_title) if mapped_title in TRAINED_JOB_CATEGORIES else 23
 
@@ -333,40 +270,6 @@ async def extract_cv(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error extracting CV: {str(e)}")
 
-# --- Job Post Endpoints (قراءة فقط - اختياري) ---
-@app.get("/api/job-posts", response_model=List[JobPostData])
-async def get_job_posts(db: Session = Depends(get_db) if engine else None):
-    if not engine:
-        raise HTTPException(status_code=501, detail="Database not configured")
-    jobs = db.query(JobPostDB).all()
-    return [JobPostData(id=j.id, **{c.name: getattr(j, c.name) for c in j.__table__.columns}) for j in jobs]
-
-@app.get("/api/job-posts/{job_id}", response_model=JobPostData)
-async def get_job_post(job_id: int, db: Session = Depends(get_db) if engine else None):
-    if not engine:
-        raise HTTPException(status_code=501, detail="Database not configured")
-    job = db.query(JobPostDB).filter(JobPostDB.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job post not found")
-    return JobPostData(id=job.id, **{c.name: getattr(job, c.name) for c in job.__table__.columns})
-
-# --- Job Applications Endpoints (اختياري) ---
-@app.get("/api/job-applications", response_model=List[CandidateData])
-async def get_job_applications(db: Session = Depends(get_db) if engine else None):
-    if not engine:
-        raise HTTPException(status_code=501, detail="Database not configured")
-    apps = db.query(JobApplicationDB).all()
-    return [CandidateData(**{c.name: getattr(app, c.name) for c in app.__table__.columns}) for app in apps]
-
-@app.get("/api/job-applications/{app_id}", response_model=CandidateData)
-async def get_job_application(app_id: int, db: Session = Depends(get_db) if engine else None):
-    if not engine:
-        raise HTTPException(status_code=501, detail="Database not configured")
-    app = db.query(JobApplicationDB).filter(JobApplicationDB.id == app_id).first()
-    if not app:
-        raise HTTPException(status_code=404, detail="Job application not found")
-    return CandidateData(**{c.name: getattr(app, c.name) for c in app.__table__.columns})
-
 # --- Match & Ranking Endpoints ---
 @app.post("/api/calculate-score", response_model=MatchScoreResponse)
 async def calculate_score_endpoint(job_post: JobPostData, candidate: CandidateData):
@@ -377,32 +280,19 @@ async def calculate_score_endpoint(job_post: JobPostData, candidate: CandidateDa
         raise HTTPException(status_code=500, detail=f"Error calculating score: {str(e)}")
 
 @app.post("/api/rank-applicants", response_model=List[RankedApplicant])
-async def rank_applicants_endpoint(request: RankingRequest, db: Session = Depends(get_db) if engine else None):
+async def rank_applicants_endpoint(request: RankingRequest):
     try:
-        # الحصول على بيانات الوظيفة إما من ID أو من الطلب مباشرة
-        job_post_data = request.job_post
-        if request.job_post_id and not job_post_data:
-            if not engine:
-                raise HTTPException(status_code=400, detail="Database not configured, please send job_post directly")
-            job_db = db.query(JobPostDB).filter(JobPostDB.id == request.job_post_id).first()
-            if not job_db:
-                raise HTTPException(status_code=404, detail="Job post not found")
-            job_post_data = JobPostData(id=job_db.id, **{c.name: getattr(job_db, c.name) for c in job_db.__table__.columns})
-        
-        if not job_post_data:
-            raise HTTPException(status_code=400, detail="Either job_post or job_post_id is required")
-
         ranked_list = []
         
         for idx, applicant in enumerate(request.applicants):
-            score_data = calculate_match_score(applicant, job_post_data)
+            score_data = calculate_match_score(applicant, request.job_post)
             ranked_list.append({
                 "score": score_data["final_score"],
                 "skill_match_ratio": score_data["skill_match_ratio"],
                 "title_match_ratio": score_data["title_match_ratio"],
                 "semantic_similarity": score_data["semantic_similarity"],
-                "location": applicant.Address,
-                "years_of_experience": applicant.YearsOfExperience,
+                "location": applicant.address,
+                "years_of_experience": applicant.years_of_experience,
                 "rank": 0
             })
         
