@@ -333,27 +333,35 @@ async def extract_cv(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error extracting CV: {str(e)}")
 
-# --- Job Post Endpoints (قراءة فقط) ---
+# --- Job Post Endpoints (قراءة فقط - اختياري) ---
 @app.get("/api/job-posts", response_model=List[JobPostData])
-async def get_job_posts(db: Session = Depends(get_db)):
+async def get_job_posts(db: Session = Depends(get_db) if engine else None):
+    if not engine:
+        raise HTTPException(status_code=501, detail="Database not configured")
     jobs = db.query(JobPostDB).all()
     return [JobPostData(id=j.id, **{c.name: getattr(j, c.name) for c in j.__table__.columns}) for j in jobs]
 
 @app.get("/api/job-posts/{job_id}", response_model=JobPostData)
-async def get_job_post(job_id: int, db: Session = Depends(get_db)):
+async def get_job_post(job_id: int, db: Session = Depends(get_db) if engine else None):
+    if not engine:
+        raise HTTPException(status_code=501, detail="Database not configured")
     job = db.query(JobPostDB).filter(JobPostDB.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job post not found")
     return JobPostData(id=job.id, **{c.name: getattr(job, c.name) for c in job.__table__.columns})
 
-# --- Job Applications Endpoints ---
+# --- Job Applications Endpoints (اختياري) ---
 @app.get("/api/job-applications", response_model=List[CandidateData])
-async def get_job_applications(db: Session = Depends(get_db)):
+async def get_job_applications(db: Session = Depends(get_db) if engine else None):
+    if not engine:
+        raise HTTPException(status_code=501, detail="Database not configured")
     apps = db.query(JobApplicationDB).all()
     return [CandidateData(**{c.name: getattr(app, c.name) for c in app.__table__.columns}) for app in apps]
 
 @app.get("/api/job-applications/{app_id}", response_model=CandidateData)
-async def get_job_application(app_id: int, db: Session = Depends(get_db)):
+async def get_job_application(app_id: int, db: Session = Depends(get_db) if engine else None):
+    if not engine:
+        raise HTTPException(status_code=501, detail="Database not configured")
     app = db.query(JobApplicationDB).filter(JobApplicationDB.id == app_id).first()
     if not app:
         raise HTTPException(status_code=404, detail="Job application not found")
@@ -369,11 +377,13 @@ async def calculate_score_endpoint(job_post: JobPostData, candidate: CandidateDa
         raise HTTPException(status_code=500, detail=f"Error calculating score: {str(e)}")
 
 @app.post("/api/rank-applicants", response_model=List[RankedApplicant])
-async def rank_applicants_endpoint(request: RankingRequest, db: Session = Depends(get_db)):
+async def rank_applicants_endpoint(request: RankingRequest, db: Session = Depends(get_db) if engine else None):
     try:
         # الحصول على بيانات الوظيفة إما من ID أو من الطلب مباشرة
         job_post_data = request.job_post
         if request.job_post_id and not job_post_data:
+            if not engine:
+                raise HTTPException(status_code=400, detail="Database not configured, please send job_post directly")
             job_db = db.query(JobPostDB).filter(JobPostDB.id == request.job_post_id).first()
             if not job_db:
                 raise HTTPException(status_code=404, detail="Job post not found")
