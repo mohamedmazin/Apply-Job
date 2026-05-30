@@ -1,328 +1,272 @@
 import ast
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import normalize
-from sklearn.ensemble import RandomForestRegressor
-import fitz
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from imblearn.over_sampling import RandomOverSampler
+import pickle
 import re
-from datetime import datetime
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import CountVectorizer , TfidfVectorizer
+import os
+import numpy as np
+import pandas as pd
+import streamlit as st
+import fitz
 import nltk
 from nltk.corpus import stopwords
-nltk.download('stopwords')
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer, util
+import xgboost as xgb
+
+# Download NLTK data
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 stop_words = set(stopwords.words('english'))
-import spacy
-import streamlit as st
 
-df = pd.read_csv("resume_data.csv")
-
-
-df_cleaned = df.dropna(thresh=len(df) * 0.5, axis=1)
-columns_to_remove = ['result_types', 'company_urls', 'educational_results','professional_company_names','locations']
-df_cleaned = df_cleaned.drop(columns=columns_to_remove)
-
-
-def extract_first_year(passing_year):
-    if isinstance(passing_year, str):
-        years = passing_year.split(',') 
-        return years[0].strip() 
-    elif isinstance(passing_year, list):
-        return passing_year[0]
+# --- 1. Load Pre-trained Models ---
+@st.cache_resource
+def load_models():
+    if os.path.exists('super_stacking_model.pkl'):
+        with open('super_stacking_model.pkl', 'rb') as f:
+            model = pickle.load(f)
     else:
-        return passing_year 
-    
-def clean_passing_year(passing_year):
+        st.error("Super model file 'super_stacking_model.pkl' not found.")
+        model = None
 
-    if isinstance(passing_year, str):
+    sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return model, sbert_model
 
-        passing_year = passing_year.replace('[', '').replace(']', '').replace("'", "").strip()
+model, sbert_model = load_models()
 
-        years = passing_year.split(',')
-        return years[0].strip()
-    else:
-       return passing_year
-    
-df_cleaned['passing_years'] = df['passing_years'].apply(extract_first_year)
-df_cleaned['passing_years'] = df['passing_years'].apply(clean_passing_year)
-df_cleaned['passing_years'] = pd.to_numeric(df_cleaned['passing_years'], errors='coerce')
+if 'applicants_list' not in st.session_state:
+    st.session_state['applicants_list'] = []
 
-def calculate_age(passing_year):
-    if pd.isnull(passing_year):
-        return np.nan
-  
-    return (2026 - passing_year) + 22
+TRAINED_JOB_CATEGORIES = [
+    'AI Engineer', 'Asst. Manager/ Manger (Administrative)', 'Business Development Executive', 
+    'Civil Engineer', 'Data Engineer', 'Data Science Engineer', 'Database Administrator (DBA)', 
+    'DevOps Engineer', 'Executive - VAT', 'Executive/ Senior Executive- Trade Marketing, Hygiene Products', 
+    'Executive/ Sr. Executive -IT', 'Full Stack Developer (Python,React js)', 'HR Officer', 
+    'Head of Internal Control & Compliance (ICC) - SEVP/DMD', 'Intern (Generative AI Engineering - 2D/3D Image Generation)', 
+    'Machine Learning (ML) Engineer', 'Management Trainee - Mechanical', 'Manager- Human Resource Management (HRM)', 
+    'Marketing Officer', 'Mechanical Designer', 'Mechanical Engineer', 'Network Support Engineer', 
+    'Project Coordinator (Civil)', 'Senior Software Engineer', 'Senior iOS Engineer', 'Site Engineer', 
+    'Sr.Officer / Executive - Internal Audit', 'System Administrator (Operation & Maintenance of Server, Storage & Service Desk System)'
+]
 
-df_cleaned['passing_years'] = df_cleaned['passing_years'].apply(calculate_age)
-mean_value = df_cleaned['passing_years'].mean()
-df_cleaned['passing_years'].fillna(abs(int(mean_value)), inplace=True)
+TECH_JOB_MAPPING = {
+    "Frontend Developer": "Senior Software Engineer",
+    "Backend Developer": "Senior Software Engineer",
+    "Mobile Developer (Android/iOS)": "Senior iOS Engineer",
+    "Flutter Developer": "Senior iOS Engineer",
+    "React Native Developer": "Senior iOS Engineer",
+    "Software Engineer": "Senior Software Engineer",
+    "Web Developer": "Full Stack Developer (Python,React js)",
+    "QA Engineer": "Senior Software Engineer",
+    "Cybersecurity Specialist": "Network Support Engineer",
+    "Cloud Architect": "DevOps Engineer",
+    "Embedded Systems Engineer": "Mechanical Engineer"
+}
 
-########################################################
-df_cleaned = df_cleaned.apply(lambda x: x.fillna(x.mode()[0]) if x.dtype == 'object' else x.fillna(x.mean()), axis=0)
-
-
-vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-skills_vectorized = vectorizer.fit_transform(df_cleaned['skills'].fillna('')) 
-skills_df = pd.DataFrame(skills_vectorized.toarray(), columns=vectorizer.get_feature_names_out())
-
-
-skills_required_vectorized = vectorizer.fit_transform(df_cleaned['skills_required'].fillna('')) 
-skills_required_df = pd.DataFrame(skills_required_vectorized.toarray(), columns=vectorizer.get_feature_names_out())
-
-
-def get_all_years(date_input, default_current=2026):
-    """دالة لتحويل القائمة أو النص إلى قائمة سنوات"""
-    years = []
-    
-    # تحويل المدخل إلى قائمة حقيقية إذا كان نصاً يمثل قائمة
-    if isinstance(date_input, str) and date_input.startswith('['):
-        try:
-            date_list = ast.literal_eval(date_input)
-        except:
-            date_list = [date_input]
-    elif isinstance(date_input, list):
-        date_list = date_input
-    else:
-        date_list = [date_input]
-
-    for item in date_list:
-        if pd.isna(item): continue
-        
-        item_str = str(item).strip()
-        # التعامل مع الكلمات التي تعني الوقت الحالي
-        if any(kw in item_str for kw in ["Ongoing", "Till Date", "Current", "Present"]):
-            years.append(default_current)
-        else:
-            try:
-                # تحويل النص لتاريخ واستخراج السنة
-                dt = pd.to_datetime(item_str, errors='coerce')
-                if pd.notnull(dt):
-                    years.append(dt.year)
-            except:
-                continue
-    return years
-
-def calculate_total_experience(row):
-    # الحصول على كل السنوات المذكورة في البداية والنهاية
-    start_years = get_all_years(row['start_dates'])
-    end_years = get_all_years(row['end_dates'])
-    
-    if not start_years:
-        return 0
-    
-    # أقدم تاريخ بدأت فيه (أصغر سنة)
-    min_start = min(start_years)
-    
-    # أحدث تاريخ انتهيت فيه (أكبر سنة)
-    # لو قائمة النهاية فاضية بنفترض إنه شغال لحد دلوقتي
-    max_end = max(end_years) if end_years else 2026
-    
-    diff = max_end - min_start
-    return max(1, diff)
-
-# تطبيق الدالة الجديدة
-df_cleaned['start_dates'] = df_cleaned.apply(calculate_total_experience, axis=1)
-df_cleaned.rename(columns={'start_dates': 'experiencere'}, inplace=True)
-df_cleaned.rename(columns={'passing_years': 'age'}, inplace=True)
-
-columns_to_remove = ['end_dates']
-df_cleaned = df_cleaned.drop(columns=columns_to_remove)
-
-
-def extract_average_value(text):
-    if pd.isna(text) or text == "" or str(text).lower() == 'nan':
-        return np.nan
-    
-    # تنظيف النص من الأقواس والعلامات
-    text = str(text).replace('[', '').replace(']', '').replace("'", "")
-    
-    # البحث عن كل الأرقام في النص
-    numbers = re.findall(r'\d+', text)
-    numbers = [int(n) for n in numbers]
-    
-    if len(numbers) >= 2:
-        # لو لقيت رقمين (زي 25 و 40) هات المتوسط
-        return sum(numbers[:2]) / 2
-    elif len(numbers) == 1:
-        # لو رقم واحد (زي at least 5) هاته هو
-        return float(numbers[0])
-    
-    return np.nan
-
-# تطبيق الدالة على الأعمدة المطلوبة
-df_cleaned['age_requirement'] = df_cleaned['age_requirement'].apply(extract_average_value)
-df_cleaned['experiencere_requirement'] = df_cleaned['experiencere_requirement'].apply(extract_average_value)
-
-df_cleaned['age_requirement'] = df_cleaned['age_requirement'].round().astype('Int64')
-df_cleaned['experiencere_requirement'] = df_cleaned['experiencere_requirement'].round().astype('Int64')
-df_cleaned['age'] = df_cleaned['age'].round().astype('Int64')
-df_cleaned['experiencere'] = df_cleaned['experiencere'].round().astype('Int64')
-
-
-
+# --- 2. Utility Functions ---
 def deep_clean_text(text):
     if pd.isna(text) or text == "": return ""
-    # 1. إزالة الأقواس المربعة والعلامات الخاصة بالـ Lists
     text = str(text).replace('[', '').replace(']', '').replace("'", "").replace('"', '')
-    # 2. تحويل لـ lowercase وإزالة علامات الترقيم
     text = text.lower()
     text = re.sub(r'[^\w\s]', ' ', text)
-    # 3. إزالة الـ Stop words والمسافات الزائدة
     words = text.split()
     clean_words = [w for w in words if w not in stop_words]
     return " ".join(clean_words)
 
-# تطبيق التنظيف على كل الأعمدة النصية مرة واحدة
-text_columns = ['related_skils_in_job', 'responsibilities', 'positions', 'major_field_of_studies', 'educationaL_requirements','degree_names','educational_institution_name']
-for col in text_columns:
-    df_cleaned[col] = df_cleaned[col].apply(deep_clean_text)
-
-
-    df_cleaned['all_resume_text'] = (
-    df_cleaned['positions'].astype(str) + " " + 
-    df_cleaned['related_skils_in_job'].astype(str) + " " + 
-    df_cleaned['major_field_of_studies'].astype(str) + " " + 
-    df_cleaned['skills'].astype(str)
-)
-
-df_cleaned['all_job_text'] = (
-    df_cleaned['educationaL_requirements'].astype(str) + " " + 
-    df_cleaned['responsibilities'].astype(str) + " " + 
-    df_cleaned['skills_required'].astype(str)
-)
-
-
-tfidf = TfidfVectorizer()
-tfidf_matrix = tfidf.fit_transform(pd.concat([df_cleaned['all_resume_text'], df_cleaned['all_job_text']]))
-
-
-mid = len(df_cleaned)
-resume_vectors = tfidf_matrix[:mid]
-job_vectors = tfidf_matrix[mid:]
-
-
-similarities = [cosine_similarity(resume_vectors[i], job_vectors[i])[0][0] for i in range(mid)]
-df_cleaned['text_similarity_score'] = similarities
-
-
-df_cleaned['age'] = df_cleaned['age'].fillna(df_cleaned['age'].mean())
-df_cleaned['experiencere'] = df_cleaned['experiencere'].fillna(0)
-df_cleaned['age_requirement'] = df_cleaned['age_requirement'].fillna(df_cleaned['age_requirement'].mean())
-df_cleaned['experiencere_requirement'] = df_cleaned['experiencere_requirement'].fillna(0)
-
-# حساب الفروقات (دي ميزات قوية جداً للموديل)
-df_cleaned['exp_diff'] = df_cleaned['experiencere'] - df_cleaned['experiencere_requirement']
-df_cleaned['age_diff'] = df_cleaned['age'] - df_cleaned['age_requirement']
-
-
-X = df_cleaned[['text_similarity_score', 'age', 'experiencere', 'exp_diff', 'age_diff']]
-y = df_cleaned['matched_score'] # السكور الحقيقي اللي في الداتا
-
-# 2. تقسيم الداتا
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# 3. تدريب الموديل
-rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
-rf_model.fit(X_train, y_train)
-
-# 4. إضافة التوقع النهائي للداتا فريم
-df_cleaned['final_match_rank'] = rf_model.predict(X)
-
-ranked_candidates = df_cleaned.sort_values(by='final_match_rank', ascending=False)
-
-
-
-
-def extract_smart_cv_data(pdf_file):
+def extract_full_cv_data(pdf_file):
     doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
     text = " ".join([page.get_text() for page in doc])
     current_year = 2026
 
-    # أ- حساب السن (ميلاد أو تخرج + 22)
+    all_years = sorted(list(set([int(y) for y in re.findall(r'\b(19[7-9][0-9]|20[0-2][0-9])\b', text)])))
     final_age = 25
-    dob_match = re.search(r'(?:birth|born|dob|date of birth)\D+(\d{4})', text, re.I)
-    edu_years = re.findall(r'(?:20[0-2][0-9]|19[7-9][0-9])(?=.*(?:University|College|Bachelor|BSc|Education))', text, re.I)
-    
-    if dob_match:
-        final_age = current_year - int(dob_match.group(1))
-    elif edu_years:
-        final_age = (current_year - int(edu_years[0])) + 22
-    else:
-        all_years = sorted(list(set([int(y) for y in re.findall(r'\b(19[7-9][0-9]|20[0-2][0-9])\b', text)])))
-        if all_years:
-            final_age = (current_year - all_years[0]) + 22
-
-    # ب- حساب الخبرة (جمل صريحة أو فترات)
+    if all_years:
+        final_age = (current_year - all_years[0]) if (current_year - all_years[0]) > 18 else (current_year - all_years[0] + 22)
     exp_matches = re.findall(r'(\d+)\s?\+?\s?years?\s?(?:of\s?)?(?:experience|exp)', text, re.I)
-    if exp_matches:
-        final_exp = int(exp_matches[0])
-    else:
-        all_years = sorted(list(set([int(y) for y in re.findall(r'\b(19[7-9][0-9]|20[0-2][0-9])\b', text)])))
-        final_exp = max(all_years) - min(all_years) if len(all_years) >= 2 else 0
+    final_exp = int(exp_matches[0]) if exp_matches else (max(all_years) - min(all_years) if len(all_years) > 1 else 0)
+    
+    addr_match = re.search(r'(?:Address|Location|Lives in)\s?[:\-]?\s*(.*)', text, re.I)
+    address = addr_match.group(1).split('\n')[0].strip() if addr_match else "Not explicitly found"
 
-    # ج- استخراج البلوكات (المهارات والتعليم)
-    skills_sec = re.search(r'(?:skills|technologies)\s?[:\-]?\n?(.*?)(?:\n\n|Experience|Education|$)', text, re.I | re.DOTALL)
-    edu_sec = re.search(r'(?:education|academic|courses)\s?[:\-]?\n?(.*?)(?:\n\n|Skills|Experience|$)', text, re.I | re.DOTALL)
+    def get_section(patterns):
+        match = re.search(rf"(?:{'|'.join(patterns)})\s?[:\-]?\n?(.*?)(?:\n\n|Education|Skills|Experience|Contact|$)", text, re.I | re.DOTALL)
+        return match.group(1).strip() if match else "Information not found"
 
     return {
+        "candidate_name": pdf_file.name.replace(".pdf", ""),
         "age": final_age,
         "experiencere": final_exp,
-        "skills": skills_sec.group(1).strip() if skills_sec else "Check CV text",
-        "education": edu_sec.group(1).strip() if edu_sec else "Check CV text",
+        "address": address,
+        "skills": get_section(["Skills", "Technologies", "Technical Skills"]),
+        "education": get_section(["Education", "Academic", "Qualifications"]),
+        "positions": get_section(["Experience", "Work History", "Professional Experience"]),
         "full_text": text
     }
 
-# --- 2. واجهة Streamlit ---
-st.set_page_config(page_title="AI Recruitment", layout="wide")
-st.title("🚀 AI Job-CV Matcher")
+# --- 3. Streamlit UI ---
+st.set_page_config(page_title="AI Hiring Platform v4.0", layout="wide", page_icon="🚀")
 
-tab1, tab2 = st.tabs(["📝 Job Posting", "📄 Upload & Match"])
+# CSS
+st.markdown("""
+    <style>
+    .main { background-color: #f4f7f9; }
+    .score-container { text-align: center; padding: 30px; border-radius: 50%; background: #ffffff; border: 10px solid #4CAF50; width: 180px; height: 180px; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 20px auto; box-shadow: 0 8px 20px rgba(76,175,80,0.3); }
+    .score-container h2 { color: #2e7d32; margin: 0; font-size: 2.5em; }
+    .applicant-row { background: white; padding: 15px; border-radius: 8px; border-left: 8px solid #4CAF50; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+    .badge { padding: 4px 10px; border-radius: 12px; font-size: 0.8em; font-weight: bold; margin-left: 5px; }
+    .badge-high { background-color: #d4edda; color: #155724; }
+    .badge-low { background-color: #f8d7da; color: #721c24; }
+    .extracted-box { background: #fffbeb; border: 1px solid #fbbf24; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    .extracted-label { font-weight: bold; color: #92400e; margin-right: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.title("🚀 AI-Powered Hiring Platform (Backend Integration Ready)")
+st.info("⚡ Model Accuracy: 83% | Language Feature Removed | Full control over extracted data")
+st.markdown("---")
+
+tab1, tab2, tab3 = st.tabs(["📝 Job Setup", "🔍 CV Upload & Apply", "🏆 Applicants Ranking"])
 
 with tab1:
-    st.header("Job Details")
+    st.header("1. Define Job Requirements")
     col1, col2 = st.columns(2)
     with col1:
-        job_title = st.text_input("Position", "Android Developer")
-        job_age = st.number_input("Target Age", 30)
+        available_roles = sorted(list(set(TRAINED_JOB_CATEGORIES + list(TECH_JOB_MAPPING.keys()))))
+        j_title = st.selectbox("Job Title / Position", available_roles, index=available_roles.index("Software Engineer") if "Software Engineer" in available_roles else 0)
+        j_skills = st.text_area("Required Skills (comma separated)", "Android, Kotlin, Java, Mobile, Firebase")
+        j_loc = st.text_input("Target Location", "Alabama, USA")
     with col2:
-        job_exp = st.number_input("Required Experience", 5)
-        job_skills = st.text_input("Must-have Skills", "Java, Python, Kotlin")
-    job_desc = st.text_area("Full Description", height=150)
-    
-    if st.button("Save Posting"):
-        st.session_state['job'] = {"age": job_age, "exp": job_exp, "desc": job_desc}
-        st.success("Saved!")
+        j_exp = st.number_input("Min Experience", 0, 20, 2)
+        j_age = st.number_input("Target Age", 18, 60, 25)
+    j_desc = st.text_area("Full Description", "Looking for an Android developer...")
+
+    if st.button("Save & Post Job"):
+        st.session_state['job_data'] = {"title": j_title, "exp": j_exp, "age": j_age, "desc": j_desc, "skills": j_skills, "loc": j_loc}
+        st.session_state['applicants_list'] = [] 
+        st.success(f"Job '{j_title}' posted!")
 
 with tab2:
-    if 'job' not in st.session_state:
-        st.warning("Please fill Job Posting first.")
+    if 'job_data' not in st.session_state:
+        st.warning("Please setup job details first.")
     else:
-        pdf = st.file_uploader("Upload CV", type="pdf")
-        if pdf:
-            cv = extract_smart_cv_data(pdf)
-            st.subheader("Confirm Data")
-            c_a, c_e = st.columns(2)
-            # هنا التعديل اليدوي اللي طلبته
-            final_age = c_a.number_input("Age", value=int(cv['age']))
-            final_exp = c_e.number_input("Experience", value=int(cv['experiencere']))
+        st.header("2. Candidate Application")
+        uploaded_file = st.file_uploader("Upload Your Resume (PDF)", type="pdf")
+        
+        if uploaded_file:
+            # We only extract once per upload to avoid overwriting edits
+            if 'last_uploaded' not in st.session_state or st.session_state['last_uploaded'] != uploaded_file.name:
+                cv = extract_full_cv_data(uploaded_file)
+                st.session_state['cv_extracted'] = cv
+                st.session_state['last_uploaded'] = uploaded_file.name
             
-            if st.button("Calculate Match"):
-                # منطق الحسبة الذكية (Weights)
-                tfidf = TfidfVectorizer(stop_words='english')
-                vecs = tfidf.fit_transform([st.session_state['job']['desc'], cv['full_text']])
-                text_sim = cosine_similarity(vecs[0:1], vecs[1:2])[0][0]
+            cv = st.session_state['cv_extracted']
+            
+            st.markdown("### 📋 Step 1: Review & Edit Extracted Data")
+            st.caption("We've extracted this from your CV. You can edit any field before submitting.")
+            
+            # Display extracted data first
+            st.markdown(f"""
+                <div class="extracted-box">
+                    <p><span class="extracted-label">📍 Address:</span> {cv['address']}</p>
+                    <p><span class="extracted-label">📜 Skills Extracted:</span> {cv['skills'][:150]}...</p>
+                    <p><span class="extracted-label">🎓 Education:</span> {cv['education'][:100]}...</p>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("### ✏️ Edit Your Data")
+            col_edit1, col_edit2 = st.columns(2)
+            with col_edit1:
+                final_name = st.text_input("Full Name", value=cv['candidate_name'])
+                final_addr_in = st.text_input("Current Address", value=cv['address'])
+                final_age_in = st.number_input("Your Age", value=int(cv['age']), min_value=18)
+            with col_edit2:
+                final_exp_in = st.number_input("Years of Experience", value=int(cv['experiencere']), min_value=0)
+                final_skills_txt = st.text_area("Skills (Editable - Comma Separated)", value=cv['skills'], height=100)
+                final_edu_txt = st.text_area("Education Details (Editable)", value=cv['education'], height=100)
 
-                # سكور السن (قرب من الـ Average)
-                age_score = max(0, 100 - (abs(final_age - st.session_state['job']['age']) * 3))
-                
-                # سكور الخبرة (Bonus لو أكتر)
-                req = st.session_state['job']['exp']
-                exp_score = 100 + ((final_exp - req) * 5) if final_exp >= req else 100 - ((req - final_exp) * 15)
-                
-                final_pct = (text_sim * 50) + (age_score * 0.20) + (exp_score * 0.30)
-                st.metric("Compatibility Score", f"{min(100.0, final_pct):.1f}%")
-                st.balloons()
+            if st.button("🚀 Apply with AI Evaluation"):
+                with st.spinner("Analyzing your edited data..."):
+                    # 1. Similarity Calculation
+                    job_text = deep_clean_text(st.session_state['job_data']['title'] + " " + st.session_state['job_data']['desc'] + " " + st.session_state['job_data']['skills'])
+                    cv_text_combined = deep_clean_text(final_name + " " + final_skills_txt + " " + final_edu_txt + " " + cv['full_text'])
+                    
+                    cv_emb = sbert_model.encode(cv_text_combined, convert_to_tensor=True)
+                    job_emb = sbert_model.encode(job_text, convert_to_tensor=True)
+                    semantic_sim = util.cos_sim(cv_emb, job_emb).item()
+
+                    # 2. Strict Title Keyword Match
+                    target_role = st.session_state['job_data']['title'].lower()
+                    clean_title = re.sub(r'[\(\)/]', ' ', target_role)
+                    title_keywords = [w for w in clean_title.split() if len(w) > 2 and w not in ["and", "the", "for"]]
+                    
+                    title_match_count = sum(1 for kw in title_keywords if kw in cv['full_text'].lower() or kw in final_skills_txt.lower())
+                    title_match_ratio = title_match_count / len(title_keywords) if title_keywords else 1.0
+                    
+                    # 3. Skill Match
+                    req_skills = set([s.strip().lower() for s in st.session_state['job_data']['skills'].split(',') if s.strip()])
+                    cv_skills_set = set(deep_clean_text(final_skills_txt).split())
+                    skill_ratio = len(cv_skills_set.intersection(req_skills)) / len(req_skills) if req_skills else 0.5
+
+                    # 4. Predict with Model
+                    selected_title = st.session_state['job_data']['title']
+                    mapped_title = TECH_JOB_MAPPING.get(selected_title, selected_title)
+                    job_cat = TRAINED_JOB_CATEGORIES.index(mapped_title) if mapped_title in TRAINED_JOB_CATEGORIES else 23
+
+                    features = np.array([[
+                        semantic_sim, skill_ratio, title_match_ratio, 
+                        float(final_age_in), float(final_exp_in), 
+                        float(final_exp_in - st.session_state['job_data']['exp']),
+                        float(final_age_in - st.session_state['job_data']['age']),
+                        float(job_cat)
+                    ]])
+                    
+                    model_score = model.predict(features)[0]
+
+                    # Domain Logic (NO LANGUAGE BONUS ANYMORE!)
+                    domain_bonus = 0.2 if title_match_ratio > 0.6 else 0.0
+                    skill_bonus = 0.2 if skill_ratio > 0.7 else 0.0
+                    domain_penalty = 0.4 if title_match_ratio < 0.4 else 0.0
+                    
+                    final_score_raw = (model_score * 0.4) + (skill_ratio * 0.3) + (title_match_ratio * 0.3) + domain_bonus + skill_bonus - domain_penalty
+                    final_pct = max(0, min(100.0, final_score_raw * 100))
+
+                    st.session_state['applicants_list'].append({
+                        "name": final_name,
+                        "score": final_pct,
+                        "skill_ratio": skill_ratio,
+                        "title_match": title_match_ratio,
+                        "semantic_sim": semantic_sim,
+                        "location": final_addr_in,
+                        "exp": final_exp_in
+                    })
+                    
+                    st.balloons()
+                    st.success("Applied!")
+                    st.markdown(f"<div class='score-container'><h2>{final_pct:.1f}%</h2></div>", unsafe_allow_html=True)
+
+with tab3:
+    st.header("3. Ranked Applicants")
+    if not st.session_state['applicants_list']:
+        st.info("No applicants yet.")
+    else:
+        ranked = sorted(st.session_state['applicants_list'], key=lambda x: x['score'], reverse=True)
+        for i, app in enumerate(ranked):
+            medal = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "👤"
+            skill_class = "badge-high" if app['skill_ratio'] > 0.7 else "badge-low"
+            st.markdown(f"""
+            <div class="applicant-row">
+                <div style="flex: 2;">
+                    <b>{medal} {app['name']}</b>
+                    <span class="badge {skill_class}">Skills: {app['skill_ratio']*100:.0f}%</span>
+                </div>
+                <div style="flex: 3; color: #666; font-size: 0.85em;">
+                    Semantic Fit: {app['semantic_sim']*100:.1f}% | Title Match: {app['title_match']*100:.0f}% | Experience: {app['exp']} yrs | Location: {app['location']}
+                </div>
+                <div style="flex: 1; text-align: right; color: #2e7d32; font-weight: bold; font-size: 1.2em;">
+                    {app['score']:.1f}%
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        if st.button("Reset All Applicants"):
+            st.session_state['applicants_list'] = []
+            st.rerun()

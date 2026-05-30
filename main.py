@@ -2,30 +2,36 @@ import ast
 import pickle
 import re
 import os
+from typing import List, Optional, Dict, Any
+from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import fitz
 import nltk
 from nltk.corpus import stopwords
-from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer, util
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from sqlalchemy import create_engine, Column, Integer, String, Text, Float
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 import uvicorn
 import io
 
-# Download NLTK data
+# تحميل المتغيرات من .env
+load_dotenv()
+
+# تحميل NLTK data
 try:
     nltk.data.find('corpora/stopwords')
 except LookupError:
     nltk.download('stopwords')
 stop_words = set(stopwords.words('english'))
 
-app = FastAPI(title="AI Hiring Platform API", version="1.0")
+app = FastAPI(title="AI Hiring Platform API", version="2.0")
 
-# Enable CORS for frontend integration
+# تفعيل CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,9 +40,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Global Variables ---
+# --- إعدادات قاعدة البيانات ---
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./hiring.db"  # احتياطي لو ما لقيتش DATABASE_URL
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- نماذج قاعدة البيانات ---
+class JobPostDB(Base):
+    __tablename__ = "job_posts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text)
+    location = Column(String(255))
+    min_salary = Column(Float)
+    max_salary = Column(Float)
+    min_age = Column(Integer)
+    max_age = Column(Integer)
+    experience_level = Column(String(100))  # "Entry", "Mid", "Senior"
+    required_skills = Column(Text)  # skills comma-separated
+
+class CandidateDB(Base):
+    __tablename__ = "candidates"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    age = Column(Integer)
+    years_of_experience = Column(Integer)
+    address = Column(String(255))
+    skills_extracted = Column(Text)
+    highest_education = Column(Text)
+    education_details_extracted = Column(Text)
+    full_text = Column(Text)
+
+# إنشاء الجداول في قاعدة البيانات
+Base.metadata.create_all(bind=engine)
+
+# Dependency للجلسة
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- المتغيرات العالمية للنموذج ---
 MODEL = None
 SBERT_MODEL = None
+
 TRAINED_JOB_CATEGORIES = [
     'AI Engineer', 'Asst. Manager/ Manger (Administrative)', 'Business Development Executive', 
     'Civil Engineer', 'Data Engineer', 'Data Science Engineer', 'Database Administrator (DBA)', 
@@ -63,50 +117,58 @@ TECH_JOB_MAPPING = {
     "Embedded Systems Engineer": "Mechanical Engineer"
 }
 
-# --- Pydantic Models for Request/Response ---
+# --- نماذج Pydantic للطلبات والاستجابات ---
 class CandidateData(BaseModel):
-    candidate_name: str
-    age: int
-    experiencere: int
-    address: str
-    skills: str
-    education: str
-    positions: str
-    full_text: str
+    age: Optional[int] = 25
+    years_of_experience: Optional[int] = 0
+    address: Optional[str] = ""
+    skills_extracted: Optional[str] = ""
+    highest_education: Optional[str] = ""
+    education_details_extracted: Optional[str] = ""
+    full_text: str = ""
 
 class JobPostData(BaseModel):
-    job_title: str
-    required_skills: str
-    target_location: str
-    min_experience: int
-    target_age: int
-    job_description: str
-
-class ApplicationRequest(BaseModel):
-    candidate_data: CandidateData
-    job_post: JobPostData
+    id: Optional[int] = None
+    title: str
+    description: Optional[str] = ""
+    location: Optional[str] = ""
+    min_age: Optional[int] = 18
+    max_age: Optional[int] = 60
+    experience_level: Optional[str] = "Entry"
+    required_skills: Optional[str] = ""
 
 class MatchScoreResponse(BaseModel):
     final_score: float
     skill_match_ratio: float
     title_match_ratio: float
     semantic_similarity: float
+    age_match_score: float
+    experience_match_score: float
 
 class RankedApplicant(BaseModel):
     rank: int
-    name: str
     score: float
     skill_match_ratio: float
     title_match_ratio: float
     semantic_similarity: float
-    location: str
-    experience: int
+    location: Optional[str] = ""
+    years_of_experience: Optional[int] = 0
 
 class RankingRequest(BaseModel):
-    job_post: JobPostData
+    job_post_id: Optional[int] = None
+    job_post: Optional[JobPostData] = None
     applicants: List[CandidateData]
 
-# --- Utility Functions ---
+# --- تحويل ExperienceLevel إلى رقم ---
+def experience_level_to_years(level: str) -> int:
+    level_map = {
+        "Entry": 0,
+        "Mid": 3,
+        "Senior": 5
+    }
+    return level_map.get(level, 0)
+
+# --- دالات الخدمة ---
 def deep_clean_text(text):
     if pd.isna(text) or text == "":
         return ""
@@ -137,14 +199,16 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
         match = re.search(rf"(?:{'|'.join(patterns)})\s?[:\-]?\n?(.*?)(?:\n\n|Education|Skills|Experience|Contact|$)", text, re.I | re.DOTALL)
         return match.group(1).strip() if match else "Information not found"
 
+    skills = get_section(["Skills", "Technologies", "Technical Skills"])
+    education = get_section(["Education", "Academic", "Qualifications"])
+
     return {
-        "candidate_name": filename.replace(".pdf", ""),
         "age": final_age,
-        "experiencere": final_exp,
+        "years_of_experience": final_exp,
         "address": address,
-        "skills": get_section(["Skills", "Technologies", "Technical Skills"]),
-        "education": get_section(["Education", "Academic", "Qualifications"]),
-        "positions": get_section(["Experience", "Work History", "Professional Experience"]),
+        "skills_extracted": skills,
+        "highest_education": education.split('\n')[0] if education else "",
+        "education_details_extracted": education,
         "full_text": text
     }
 
@@ -163,61 +227,81 @@ def load_models():
     
     return MODEL, SBERT_MODEL
 
-def calculate_match_score(candidate_data: CandidateData, job_post: JobPostData):
+def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     model, sbert_model = load_models()
     
-    # 1. Semantic Similarity (SBERT)
-    job_text = deep_clean_text(job_post.job_title + " " + job_post.job_description + " " + job_post.required_skills)
-    cv_text_combined = deep_clean_text(candidate_data.candidate_name + " " + candidate_data.skills + " " + candidate_data.education + " " + candidate_data.full_text)
+    # 1. التشابه الدلالي (SBERT)
+    job_text = deep_clean_text(job_post.title + " " + (job_post.description or "") + " " + (job_post.required_skills or ""))
+    cv_text_combined = deep_clean_text((candidate.skills_extracted or "") + " " + (candidate.education_details_extracted or "") + " " + (candidate.full_text or ""))
     
     cv_emb = sbert_model.encode(cv_text_combined, convert_to_tensor=True)
     job_emb = sbert_model.encode(job_text, convert_to_tensor=True)
     semantic_sim = util.cos_sim(cv_emb, job_emb).item()
 
-    # 2. Strict Title Keyword Match
-    target_role = job_post.job_title.lower()
+    # 2. مطابقة الكلمات المفتاحية للعنوان
+    target_role = job_post.title.lower()
     clean_title = re.sub(r'[\(\)/]', ' ', target_role)
     title_keywords = [w for w in clean_title.split() if len(w) > 2 and w not in ["and", "the", "for"]]
     
-    title_match_count = sum(1 for kw in title_keywords if kw in candidate_data.full_text.lower() or kw in candidate_data.skills.lower())
+    title_match_count = sum(1 for kw in title_keywords if kw in (candidate.full_text or "").lower() or kw in (candidate.skills_extracted or "").lower())
     title_match_ratio = title_match_count / len(title_keywords) if title_keywords else 1.0
     
-    # 3. Skill Match
-    req_skills = set([s.strip().lower() for s in job_post.required_skills.split(',') if s.strip()])
-    cv_skills_set = set(deep_clean_text(candidate_data.skills).split())
+    # 3. مطابقة المهارات
+    req_skills = set([s.strip().lower() for s in (job_post.required_skills or "").split(',') if s.strip()])
+    cv_skills_set = set(deep_clean_text(candidate.skills_extracted or "").split())
     skill_ratio = len(cv_skills_set.intersection(req_skills)) / len(req_skills) if req_skills else 0.5
 
-    # 4. Predict with Model
-    selected_title = job_post.job_title
+    # 4. مطابقة العمر (Range)
+    age = candidate.age or 25
+    min_age = job_post.min_age or 18
+    max_age = job_post.max_age or 60
+    if min_age <= age <= max_age:
+        age_match_score = 1.0
+    elif age < min_age:
+        age_match_score = max(0, 1 - (min_age - age) / 10)
+    else:
+        age_match_score = max(0, 1 - (age - max_age) / 10)
+
+    # 5. مطابقة الخبرة
+    exp_candidate = candidate.years_of_experience or 0
+    exp_required = experience_level_to_years(job_post.experience_level or "Entry")
+    exp_diff = exp_candidate - exp_required
+    experience_match_score = max(0, min(1.0, 0.5 + exp_diff / 5))
+
+    # 6. التنبؤ باستخدام النموذج
+    selected_title = job_post.title
     mapped_title = TECH_JOB_MAPPING.get(selected_title, selected_title)
     job_cat = TRAINED_JOB_CATEGORIES.index(mapped_title) if mapped_title in TRAINED_JOB_CATEGORIES else 23
 
     features = np.array([[
         semantic_sim, skill_ratio, title_match_ratio, 
-        float(candidate_data.age), float(candidate_data.experiencere), 
-        float(candidate_data.experiencere - job_post.min_experience),
-        float(candidate_data.age - job_post.target_age),
+        float(age), float(exp_candidate), 
+        float(exp_diff),
+        float(age - (min_age + max_age)/2),
         float(job_cat)
     ]])
     
     model_score = model.predict(features)[0]
 
-    # Domain Logic (No Language Bonus!)
+    # منطق المجال
     domain_bonus = 0.2 if title_match_ratio > 0.6 else 0.0
     skill_bonus = 0.2 if skill_ratio > 0.7 else 0.0
     domain_penalty = 0.4 if title_match_ratio < 0.4 else 0.0
     
     final_score_raw = (model_score * 0.4) + (skill_ratio * 0.3) + (title_match_ratio * 0.3) + domain_bonus + skill_bonus - domain_penalty
+    final_score_raw *= (0.7 * age_match_score + 0.3 * experience_match_score)
     final_pct = max(0, min(100.0, final_score_raw * 100))
 
     return {
         "final_score": final_pct,
         "skill_match_ratio": skill_ratio,
         "title_match_ratio": title_match_ratio,
-        "semantic_similarity": semantic_sim
+        "semantic_similarity": semantic_sim,
+        "age_match_score": age_match_score,
+        "experience_match_score": experience_match_score
     }
 
-# --- API Endpoints ---
+# --- نقاط النهاية (Endpoints) ---
 @app.on_event("startup")
 async def startup_event():
     print("Loading AI models...")
@@ -226,15 +310,15 @@ async def startup_event():
 
 @app.get("/")
 async def root():
-    return {"message": "AI Hiring Platform API is running!", "version": "1.0"}
+    return {"message": "AI Hiring Platform API is running!", "version": "2.0"}
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
 
+# --- CV Endpoints ---
 @app.post("/api/extract-cv", response_model=CandidateData)
 async def extract_cv(file: UploadFile = File(...)):
-    """Extract data from a PDF CV file"""
     try:
         contents = await file.read()
         cv_data = extract_full_cv_data_from_pdf(contents, file.filename)
@@ -242,38 +326,68 @@ async def extract_cv(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error extracting CV: {str(e)}")
 
+# --- Job Post Endpoints ---
+@app.post("/api/job-posts", response_model=JobPostData)
+async def create_job_post(job: JobPostData, db: Session = Depends(get_db)):
+    db_job = JobPostDB(**job.model_dump(exclude={'id'}))
+    db.add(db_job)
+    db.commit()
+    db.refresh(db_job)
+    return JobPostData(id=db_job.id, **job.model_dump(exclude={'id'}))
+
+@app.get("/api/job-posts", response_model=List[JobPostData])
+async def get_job_posts(db: Session = Depends(get_db)):
+    jobs = db.query(JobPostDB).all()
+    return [JobPostData(id=j.id, **{c.name: getattr(j, c.name) for c in j.__table__.columns}) for j in jobs]
+
+@app.get("/api/job-posts/{job_id}", response_model=JobPostData)
+async def get_job_post(job_id: int, db: Session = Depends(get_db)):
+    job = db.query(JobPostDB).filter(JobPostDB.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job post not found")
+    return JobPostData(id=job.id, **{c.name: getattr(job, c.name) for c in job.__table__.columns})
+
+# --- Match & Ranking Endpoints ---
 @app.post("/api/calculate-score", response_model=MatchScoreResponse)
-async def calculate_score(request: ApplicationRequest):
-    """Calculate match score between a candidate and a job post"""
+async def calculate_score_endpoint(job_post: JobPostData, candidate: CandidateData):
     try:
-        result = calculate_match_score(request.candidate_data, request.job_post)
+        result = calculate_match_score(candidate, job_post)
         return MatchScoreResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating score: {str(e)}")
 
 @app.post("/api/rank-applicants", response_model=List[RankedApplicant])
-async def rank_applicants(request: RankingRequest):
-    """Rank multiple applicants for a job post and return sorted results"""
+async def rank_applicants_endpoint(request: RankingRequest, db: Session = Depends(get_db)):
     try:
+        # الحصول على بيانات الوظيفة إما من ID أو من الطلب مباشرة
+        job_post_data = request.job_post
+        if request.job_post_id and not job_post_data:
+            job_db = db.query(JobPostDB).filter(JobPostDB.id == request.job_post_id).first()
+            if not job_db:
+                raise HTTPException(status_code=404, detail="Job post not found")
+            job_post_data = JobPostData(id=job_db.id, **{c.name: getattr(job_db, c.name) for c in job_db.__table__.columns})
+        
+        if not job_post_data:
+            raise HTTPException(status_code=400, detail="Either job_post or job_post_id is required")
+
         ranked_list = []
         
         for idx, applicant in enumerate(request.applicants):
-            score_data = calculate_match_score(applicant, request.job_post)
+            score_data = calculate_match_score(applicant, job_post_data)
             ranked_list.append({
-                "name": applicant.candidate_name,
                 "score": score_data["final_score"],
                 "skill_match_ratio": score_data["skill_match_ratio"],
                 "title_match_ratio": score_data["title_match_ratio"],
                 "semantic_similarity": score_data["semantic_similarity"],
                 "location": applicant.address,
-                "experience": applicant.experiencere,
+                "years_of_experience": applicant.years_of_experience,
                 "rank": 0
             })
         
-        # Sort by score descending
+        # ترتيب حسب النتيجة تنازلياً
         ranked_list.sort(key=lambda x: x["score"], reverse=True)
         
-        # Assign ranks
+        # إعطاء الترتيب
         for idx, applicant in enumerate(ranked_list):
             applicant["rank"] = idx + 1
         
@@ -282,4 +396,5 @@ async def rank_applicants(request: RankingRequest):
         raise HTTPException(status_code=500, detail=f"Error ranking applicants: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
