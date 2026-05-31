@@ -125,67 +125,132 @@ def deep_clean_text(text):
 
 def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = " ".join([page.get_text() for page in doc])
     current_year = 2026
 
+    # --- Extract text WITH LAYOUT (lines + positions) ---
+    lines = []
+    for page in doc:
+        blocks = page.get_text("blocks")  # (x0, y0, x1, y1, text, block_no, block_type)
+        for block in blocks:
+            if block[6] == 0:  # Text block only
+                block_text = block[4].strip()
+                if block_text:
+                    lines.append({
+                        "text": block_text,
+                        "y0": block[1],  # Top position
+                        "y1": block[3],  # Bottom position
+                    })
+    # Sort lines top to bottom
+    lines = sorted(lines, key=lambda x: x["y0"])
+    full_text = " ".join([l["text"] for l in lines])
+
+    # --- Helper function to detect headers ---
+    def is_header(line_text):
+        # Check if line is a section header (ALL CAPS, bold-like, or ends with :)
+        t = line_text.strip()
+        # Common header keywords
+        header_keywords = ['skills', 'technical skills', 'technologies', 'tech stack', 
+                           'core competencies', 'technical expertise',
+                           'education', 'academic', 'qualifications',
+                           'experience', 'work', 'employment',
+                           'projects', 'certifications', 'summary', 'objective',
+                           'address', 'location', 'contact', 'personal']
+        has_header_kw = any(kw in t.lower() for kw in header_keywords)
+        is_all_caps = t.isupper() and len(t) > 2
+        ends_with_colon = t.endswith(':')
+        return has_header_kw or is_all_caps or ends_with_colon
+
     # --- 1. Extract Age ---
-    all_years = sorted(list(set([int(y) for y in re.findall(r'\b(19[7-9][0-9]|20[0-2][0-9])\b', text)])))
+    all_years = sorted(list(set([int(y) for y in re.findall(r'\b(19[7-9][0-9]|20[0-2][0-9])\b', full_text)])))
     final_age = 25
     if all_years:
-        # Try to find birth year (earliest year)
         final_age = (current_year - all_years[0]) if (current_year - all_years[0]) > 18 else (current_year - all_years[0] + 22)
     
     # --- 2. Extract Experience ---
-    exp_matches = re.findall(r'(\d+)\s?\+?\s?years?\s?(?:of\s?)?(?:experience|exp)', text, re.I)
+    exp_matches = re.findall(r'(\d+)\s?\+?\s?years?\s?(?:of\s?)?(?:experience|exp)', full_text, re.I)
+    final_exp = 0
     if exp_matches:
         final_exp = int(exp_matches[0])
     else:
-        # Try to find date ranges
-        date_ranges = re.findall(r'(\d{4})\s*[-–—]\s*(\d{4}|Present|Current|Now)', text, re.I)
+        date_ranges = re.findall(r'(\d{4})\s*[-–—]\s*(\d{4}|Present|Current|Now)', full_text, re.I)
         exp_years = 0
         for start, end in date_ranges:
             end_year = current_year if end.lower() in ['present', 'current', 'now'] else int(end)
             exp_years += max(0, end_year - int(start))
         final_exp = exp_years if exp_years > 0 else 0
     
-    # --- 3. Extract Address ---
-    addr_patterns = [
-        r'(?:Address|Location|Lives in|Based in|Residence)\s*[:\-]?\s*(.*?)(?:\n|$)',
-        r'(\w+,\s*\w+,\s*\w+|\w+,\s*\w+)',  # City, State, Country or City, Country
-    ]
+    # --- 3. Extract Address (using line-by-line top section) ---
     address = "Not explicitly found"
-    for pattern in addr_patterns:
-        addr_match = re.search(pattern, text, re.I)
-        if addr_match:
-            address = addr_match.group(1).strip()
-            if len(address) > 5:
+    top_lines = lines[:20]  # Check top 20 lines for address
+    addr_header_found = False
+    for i, line in enumerate(top_lines):
+        t = line["text"].lower()
+        # Look for Address/Location header
+        if any(kw in t for kw in ['address', 'location', 'lives in', 'based in', 'residence']):
+            addr_header_found = True
+            # Check next 3 lines for address
+            for j in range(i+1, min(i+4, len(top_lines))):
+                candidate = top_lines[j]["text"].strip()
+                if len(candidate) > 3 and len(candidate) < 100 and not is_header(candidate):
+                    address = candidate
+                    break
+            # Also check if address is on same line as header
+            same_line = re.search(r'(?:Address|Location|Lives in|Based in|Residence)\s*[:\-]?\s*(.*)', line["text"], re.I)
+            if same_line and same_line.group(1):
+                address = same_line.group(1).strip()
+            break
+    # Fallback: look for city, state pattern in top lines
+    if address == "Not explicitly found":
+        for line in top_lines:
+            city_pattern = re.search(r'(\w+,\s*\w+,\s*\w+|\w+,\s*\w+)', line["text"])
+            if city_pattern and not any(kw in line["text"].lower() for kw in ['skills', 'education']):
+                address = city_pattern.group(1).strip()
                 break
 
-    # --- 4. Extract Skills (improved) ---
-    skill_section_patterns = [
-        r'(?:Skills|Technical Skills|Technologies|Tech Stack|Core Competencies|Technical Expertise)\s*[:\-]?\s*(.*?)(?:\n\n|\bExperience\b|\bEducation\b|\bProjects\b|\bCertifications\b|\bSummary\b|$)',
-        r'(?:Skills|Technical Skills|Technologies|Tech Stack|Core Competencies|Technical Expertise)\s*[:\-]?\s*(.*?)(?=\b[A-Z][a-z]+:|$)'
-    ]
+    # --- 4. Extract Skills (using section detection) ---
     skills = "Information not found"
-    for pattern in skill_section_patterns:
-        skills_match = re.search(pattern, text, re.I | re.DOTALL)
-        if skills_match:
-            skills = skills_match.group(1).strip()
-            if len(skills) > 10:
-                break
+    skills_collected = []
+    in_skills_section = False
+    for i, line in enumerate(lines):
+        t = line["text"].lower()
+        # Enter skills section
+        if any(kw in t for kw in ['skills', 'technical skills', 'technologies', 'tech stack', 'core competencies', 'technical expertise']):
+            in_skills_section = True
+            # Check if skills are on same line
+            same_line = re.search(r'(?:Skills|Technical Skills|Technologies|Tech Stack|Core Competencies|Technical Expertise)\s*[:\-]?\s*(.*)', line["text"], re.I)
+            if same_line and same_line.group(1):
+                skills_collected.append(same_line.group(1).strip())
+            continue
+        
+        # Exit skills section when next header found
+        if in_skills_section and is_header(line["text"]):
+            break
+        
+        # Collect skills
+        if in_skills_section:
+            skills_collected.append(line["text"].strip())
+    
+    if skills_collected:
+        skills = "\n".join([s for s in skills_collected if s])
 
-    # --- 5. Extract Education (improved) ---
-    edu_section_patterns = [
-        r'(?:Education|Academic Background|Qualifications|Academic|Academic Qualifications)\s*[:\-]?\s*(.*?)(?:\n\n|\bExperience\b|\bSkills\b|\bProjects\b|\bCertifications\b|\bSummary\b|$)',
-        r'(?:Education|Academic Background|Qualifications|Academic|Academic Qualifications)\s*[:\-]?\s*(.*?)(?=\b[A-Z][a-z]+:|$)'
-    ]
+    # --- 5. Extract Education (using section detection) ---
     education = "Information not found"
-    for pattern in edu_section_patterns:
-        edu_match = re.search(pattern, text, re.I | re.DOTALL)
-        if edu_match:
-            education = edu_match.group(1).strip()
-            if len(education) > 10:
-                break
+    edu_collected = []
+    in_edu_section = False
+    for i, line in enumerate(lines):
+        t = line["text"].lower()
+        if any(kw in t for kw in ['education', 'academic background', 'qualifications', 'academic']):
+            in_edu_section = True
+            same_line = re.search(r'(?:Education|Academic Background|Qualifications|Academic)\s*[:\-]?\s*(.*)', line["text"], re.I)
+            if same_line and same_line.group(1):
+                edu_collected.append(same_line.group(1).strip())
+            continue
+        if in_edu_section and is_header(line["text"]):
+            break
+        if in_edu_section:
+            edu_collected.append(line["text"].strip())
+    if edu_collected:
+        education = "\n".join([s for s in edu_collected if s])
 
     # --- 6. Extract Highest Education ---
     highest_education = "Information not found"
@@ -196,10 +261,10 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
         (r'(Associate|Diploma|High School|Secondary)', "Associate/Diploma"),
     ]
     for pattern, degree in edu_keywords:
-        if re.search(pattern, education, re.I) or re.search(pattern, text, re.I):
+        if re.search(pattern, education, re.I) or re.search(pattern, full_text, re.I):
             highest_education = degree
             break
-    if highest_education == "Information not found" and education and len(education) > 0:
+    if highest_education == "Information not found" and education:
         highest_education = education.split('\n')[0][:50] if '\n' in education else education[:50]
 
     return {
@@ -209,7 +274,7 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
         "skills_extracted": skills,
         "highest_education": highest_education,
         "education_details_extracted": education,
-        "full_text": text
+        "full_text": full_text
     }
 
 def load_models():
