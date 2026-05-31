@@ -128,30 +128,86 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
     text = " ".join([page.get_text() for page in doc])
     current_year = 2026
 
+    # --- 1. Extract Age ---
     all_years = sorted(list(set([int(y) for y in re.findall(r'\b(19[7-9][0-9]|20[0-2][0-9])\b', text)])))
     final_age = 25
     if all_years:
+        # Try to find birth year (earliest year)
         final_age = (current_year - all_years[0]) if (current_year - all_years[0]) > 18 else (current_year - all_years[0] + 22)
     
+    # --- 2. Extract Experience ---
     exp_matches = re.findall(r'(\d+)\s?\+?\s?years?\s?(?:of\s?)?(?:experience|exp)', text, re.I)
-    final_exp = int(exp_matches[0]) if exp_matches else (max(all_years) - min(all_years) if len(all_years) > 1 else 0)
+    if exp_matches:
+        final_exp = int(exp_matches[0])
+    else:
+        # Try to find date ranges
+        date_ranges = re.findall(r'(\d{4})\s*[-–—]\s*(\d{4}|Present|Current|Now)', text, re.I)
+        exp_years = 0
+        for start, end in date_ranges:
+            end_year = current_year if end.lower() in ['present', 'current', 'now'] else int(end)
+            exp_years += max(0, end_year - int(start))
+        final_exp = exp_years if exp_years > 0 else 0
     
-    addr_match = re.search(r'(?:Address|Location|Lives in)\s?[:\-]?\s*(.*)', text, re.I)
-    address = addr_match.group(1).split('\n')[0].strip() if addr_match else "Not explicitly found"
+    # --- 3. Extract Address ---
+    addr_patterns = [
+        r'(?:Address|Location|Lives in|Based in|Residence)\s*[:\-]?\s*(.*?)(?:\n|$)',
+        r'(\w+,\s*\w+,\s*\w+|\w+,\s*\w+)',  # City, State, Country or City, Country
+    ]
+    address = "Not explicitly found"
+    for pattern in addr_patterns:
+        addr_match = re.search(pattern, text, re.I)
+        if addr_match:
+            address = addr_match.group(1).strip()
+            if len(address) > 5:
+                break
 
-    def get_section(patterns):
-        match = re.search(rf"(?:{'|'.join(patterns)})\s?[:\-]?\n?(.*?)(?:\n\n|Education|Skills|Experience|Contact|$)", text, re.I | re.DOTALL)
-        return match.group(1).strip() if match else "Information not found"
+    # --- 4. Extract Skills (improved) ---
+    skill_section_patterns = [
+        r'(?:Skills|Technical Skills|Technologies|Tech Stack|Core Competencies|Technical Expertise)\s*[:\-]?\s*(.*?)(?:\n\n|\bExperience\b|\bEducation\b|\bProjects\b|\bCertifications\b|\bSummary\b|$)',
+        r'(?:Skills|Technical Skills|Technologies|Tech Stack|Core Competencies|Technical Expertise)\s*[:\-]?\s*(.*?)(?=\b[A-Z][a-z]+:|$)'
+    ]
+    skills = "Information not found"
+    for pattern in skill_section_patterns:
+        skills_match = re.search(pattern, text, re.I | re.DOTALL)
+        if skills_match:
+            skills = skills_match.group(1).strip()
+            if len(skills) > 10:
+                break
 
-    skills = get_section(["Skills", "Technologies", "Technical Skills"])
-    education = get_section(["Education", "Academic", "Qualifications"])
+    # --- 5. Extract Education (improved) ---
+    edu_section_patterns = [
+        r'(?:Education|Academic Background|Qualifications|Academic|Academic Qualifications)\s*[:\-]?\s*(.*?)(?:\n\n|\bExperience\b|\bSkills\b|\bProjects\b|\bCertifications\b|\bSummary\b|$)',
+        r'(?:Education|Academic Background|Qualifications|Academic|Academic Qualifications)\s*[:\-]?\s*(.*?)(?=\b[A-Z][a-z]+:|$)'
+    ]
+    education = "Information not found"
+    for pattern in edu_section_patterns:
+        edu_match = re.search(pattern, text, re.I | re.DOTALL)
+        if edu_match:
+            education = edu_match.group(1).strip()
+            if len(education) > 10:
+                break
+
+    # --- 6. Extract Highest Education ---
+    highest_education = "Information not found"
+    edu_keywords = [
+        (r'(PhD|Doctor(?:ate)?|Doctor of)', "PhD"),
+        (r'(Master|MS|MSc|MA|MPhil|MBA)', "Master's Degree"),
+        (r'(Bachelor|BS|BSc|BA|BBA|BE|BEng)', "Bachelor's Degree"),
+        (r'(Associate|Diploma|High School|Secondary)', "Associate/Diploma"),
+    ]
+    for pattern, degree in edu_keywords:
+        if re.search(pattern, education, re.I) or re.search(pattern, text, re.I):
+            highest_education = degree
+            break
+    if highest_education == "Information not found" and education and len(education) > 0:
+        highest_education = education.split('\n')[0][:50] if '\n' in education else education[:50]
 
     return {
         "age": final_age,
         "years_of_experience": final_exp,
         "address": address,
         "skills_extracted": skills,
-        "highest_education": education.split('\n')[0] if education else "",
+        "highest_education": highest_education,
         "education_details_extracted": education,
         "full_text": text
     }
