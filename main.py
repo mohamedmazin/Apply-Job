@@ -69,7 +69,6 @@ class CandidateData(BaseModel):
     years_of_experience: Optional[int] = 0
     address: Optional[str] = ""
     skills_extracted: Optional[str] = ""
-    skills_extracted_filtered: Optional[str] = ""
     highest_education: Optional[str] = ""
     education_details_extracted: Optional[str] = ""
     full_text: str = ""
@@ -307,8 +306,7 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
         "age": final_age,
         "years_of_experience": final_exp,
         "address": address,
-        "skills_extracted": raw_skills,
-        "skills_extracted_filtered": filtered_skills,
+        "skills_extracted": filtered_skills,
         "highest_education": highest_education,
         "education_details_extracted": education,
         "full_text": full_text
