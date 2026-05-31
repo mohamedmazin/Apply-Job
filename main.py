@@ -127,23 +127,40 @@ def deep_clean_text(text):
 COMMON_SKILLS = [
     # Programming Languages
     "Python", "Java", "C#", "C++", "JavaScript", "TypeScript", "PHP", "Ruby", "Go", "Rust",
-    "Swift", "Kotlin", "C", "R", "SQL", "HTML", "CSS", "Scala", "Perl",
+    "Swift", "Kotlin", "C", "R", "SQL", "HTML", "CSS", "Scala", "Perl", "Dart", "Lua",
+    "Shell", "Bash", "PowerShell", "MATLAB", "Groovy", "Objective-C",
     # Frameworks & Libraries
-    "ASP.NET", "ASP.NET Core", "Django", "Flask", "Express", "React", "Vue.js", "Angular",
-    "Spring", "Spring Boot", "Entity Framework", "Node.js", "Next.js", "Nuxt.js", "jQuery",
-    "Bootstrap", "Tailwind CSS", "Material UI", "TensorFlow", "PyTorch", "Keras",
+    "ASP.NET", "ASP.NET Core", "ASP.NET Core MVC", "Razor Pages", "Django", "Flask", "Express", "React",
+    "React.js", "React Native", "Vue.js", "Vue", "Angular", "Angular.js", "Spring", "Spring Boot",
+    "Entity Framework", "Entity Framework Core", "Node.js", "Next.js", "Nuxt.js", "jQuery",
+    "Bootstrap", "Tailwind CSS", "Tailwind", "Material UI", "Material-UI", "MUI", "TensorFlow",
+    "PyTorch", "Keras", "Pandas", "NumPy", "Scikit-learn", "Matplotlib", "Seaborn", "FastAPI",
+    "Flask", "Laravel", "Symfony", "CodeIgniter", "Yii", "CakePHP", "Zend",
     # Databases
     "SQL Server", "MySQL", "PostgreSQL", "MongoDB", "Oracle", "Redis", "SQLite", "Firebase",
+    "MariaDB", "DynamoDB", "Cassandra", "CouchDB", "Elasticsearch", "Solr",
     # Tools & Technologies
-    "Git", "GitHub", "GitLab", "Docker", "Kubernetes", "AWS", "Azure", "GCP", "Linux", "Windows",
-    "REST API", "GraphQL", "CI/CD", "Jira", "Confluence", "Slack", "Trello",
+    "Git", "GitHub", "GitLab", "Bitbucket", "Docker", "Kubernetes", "AWS", "Amazon Web Services",
+    "Azure", "Microsoft Azure", "GCP", "Google Cloud Platform", "Linux", "Windows", "MacOS",
+    "REST API", "RESTful APIs", "RESTful API", "GraphQL", "CI/CD", "Jenkins", "GitLab CI",
+    "GitHub Actions", "CircleCI", "Travis CI", "Jira", "Confluence", "Slack", "Trello",
+    "Figma", "Adobe XD", "Photoshop", "Illustrator", "Sketch", "Postman", "Swagger",
+    "RabbitMQ", "Kafka", "Redis", "Memcached", "Nginx", "Apache", "IIS",
     # Concepts
-    "Data Structures", "Algorithms", "OOP", "Object-Oriented Programming", "SOLID Principles",
-    "Machine Learning", "Deep Learning", "Artificial Intelligence", "Data Science",
+    "Data Structures", "Algorithms", "OOP", "Object-Oriented Programming", "SOLID Principles", "Design Patterns",
+    "Machine Learning", "Deep Learning", "Artificial Intelligence", "Data Science", "Big Data",
     "Web Development", "Backend Development", "Frontend Development", "Full Stack Development",
-    # Soft Skills (optional, if you want them)
+    "Mobile Development", "Responsive Design", "Agile", "Scrum", "Kanban", "DevOps",
+    "Microservices", "Monolithic", "REST", "SOAP", "API", "Web Services",
+    "Authentication", "Authorization", "OAuth", "JWT", "JSON Web Tokens",
+    "Password Hashing", "Security", "Cybersecurity", "Penetration Testing", "Ethical Hacking",
+    "Database Management", "SQL Injection", "XSS", "Cross-Site Scripting",
+    "Performance Optimization", "Scalability", "High Availability", "Load Balancing",
+    # Soft Skills
     "Communication", "Teamwork", "Leadership", "Problem Solving", "Time Management",
-    "Stress Management", "Critical Thinking", "Creativity"
+    "Stress Management", "Critical Thinking", "Creativity", "Adaptability", "Collaboration",
+    "Presentation Skills", "Negotiation", "Decision Making", "Emotional Intelligence",
+    "Customer Service", "Multitasking", "Attention to Detail", "Flexibility"
 ]
 
 def extract_known_skills(text: str):
@@ -243,11 +260,14 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
 
     # --- 4. Extract Address (from top section or patterns) ---
     address = "Not explicitly found"
-    # Look for city-country pattern first (like "Giza – Egypt")
-    location_match = re.search(r'(\w+,\s*\w+|\w+\s*[-–]\s*\w+)', raw_lines[0] if len(raw_lines) > 0 else full_text[:200])
+    # Look in the first few lines for location patterns
+    top_section_text = ' '.join(raw_lines[:5]) if len(raw_lines) > 0 else full_text[:300]
+    # Look for patterns like "Mit Akaba, Giza" or "Giza, Egypt"
+    location_match = re.search(r'([A-Za-z\s]+,\s*[A-Za-z\s]+)', top_section_text)
     if location_match:
         candidate = location_match.group(1).strip()
-        if len(candidate) > 3 and not any(kw in candidate.lower() for kw in ['skills', 'education', 'experience', 'github', 'linkedin']):
+        # Make sure it's not something like a name or email
+        if len(candidate) > 3 and len(candidate) < 100 and '@' not in candidate and not any(kw in candidate.lower() for kw in ['skills', 'education', 'experience', 'github', 'linkedin', 'gmail', 'email']):
             address = candidate
     # Fallback: look for "Location" or "Address" in top lines
     if address == "Not explicitly found":
@@ -264,7 +284,9 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
 
     # --- 5. Extract Skills (raw + filtered) ---
     raw_skills = "Information not found"
-    skills_text = get_section_text(skill_section_headers, all_section_headers)
+    # For skills, end keywords exclude other skill headers (so it doesn't stop at "Technical Skills")
+    skill_end_keywords = [kw for kw in all_section_headers if kw not in skill_section_headers]
+    skills_text = get_section_text(skill_section_headers, skill_end_keywords)
     if skills_text and len(skills_text) > 10:
         raw_skills = skills_text
     # Fallback: look for lines with many technical keywords (simple heuristic)
@@ -302,11 +324,13 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
         highest_education = education.split('\n')[0][:50] if '\n' in education else education[:50]
 
     # --- Return all data ---
+    # If filtered skills are empty, use the raw extracted skills instead
+    final_skills = filtered_skills if filtered_skills != "Information not found" else raw_skills
     return {
         "age": final_age,
         "years_of_experience": final_exp,
         "address": address,
-        "skills_extracted": filtered_skills,
+        "skills_extracted": final_skills,
         "highest_education": highest_education,
         "education_details_extracted": education,
         "full_text": full_text
