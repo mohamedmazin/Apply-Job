@@ -69,6 +69,7 @@ class CandidateData(BaseModel):
     years_of_experience: Optional[int] = 0
     address: Optional[str] = ""
     skills_extracted: Optional[str] = ""
+    skills_extracted_filtered: Optional[str] = ""
     highest_education: Optional[str] = ""
     education_details_extracted: Optional[str] = ""
     full_text: str = ""
@@ -122,6 +123,50 @@ def deep_clean_text(text):
     words = text.split()
     clean_words = [w for w in words if w not in stop_words]
     return " ".join(clean_words)
+
+# --- Common known skills list (you can add more!) ---
+COMMON_SKILLS = [
+    # Programming Languages
+    "Python", "Java", "C#", "C++", "JavaScript", "TypeScript", "PHP", "Ruby", "Go", "Rust",
+    "Swift", "Kotlin", "C", "R", "SQL", "HTML", "CSS", "Scala", "Perl",
+    # Frameworks & Libraries
+    "ASP.NET", "ASP.NET Core", "Django", "Flask", "Express", "React", "Vue.js", "Angular",
+    "Spring", "Spring Boot", "Entity Framework", "Node.js", "Next.js", "Nuxt.js", "jQuery",
+    "Bootstrap", "Tailwind CSS", "Material UI", "TensorFlow", "PyTorch", "Keras",
+    # Databases
+    "SQL Server", "MySQL", "PostgreSQL", "MongoDB", "Oracle", "Redis", "SQLite", "Firebase",
+    # Tools & Technologies
+    "Git", "GitHub", "GitLab", "Docker", "Kubernetes", "AWS", "Azure", "GCP", "Linux", "Windows",
+    "REST API", "GraphQL", "CI/CD", "Jira", "Confluence", "Slack", "Trello",
+    # Concepts
+    "Data Structures", "Algorithms", "OOP", "Object-Oriented Programming", "SOLID Principles",
+    "Machine Learning", "Deep Learning", "Artificial Intelligence", "Data Science",
+    "Web Development", "Backend Development", "Frontend Development", "Full Stack Development",
+    # Soft Skills (optional, if you want them)
+    "Communication", "Teamwork", "Leadership", "Problem Solving", "Time Management",
+    "Stress Management", "Critical Thinking", "Creativity"
+]
+
+def extract_known_skills(text: str):
+    if not text or text == "Information not found":
+        return "Information not found"
+    
+    found_skills = []
+    text_lower = text.lower()
+    
+    for skill in COMMON_SKILLS:
+        # Use word boundaries to match whole skill only
+        # Escape special characters in skill name (like C# becomes C\#)
+        skill_lower = skill.lower()
+        # Check if skill exists as whole word in text
+        pattern = r'\b' + re.escape(skill_lower) + r'\b'
+        if re.search(pattern, text_lower):
+            found_skills.append(skill)
+    
+    if found_skills:
+        return ", ".join(found_skills)
+    else:
+        return "Information not found"
 
 def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -218,13 +263,13 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
                         address = candidate
                         break
 
-    # --- 5. Extract Skills ---
-    skills = "Information not found"
+    # --- 5. Extract Skills (raw + filtered) ---
+    raw_skills = "Information not found"
     skills_text = get_section_text(skill_section_headers, all_section_headers)
     if skills_text and len(skills_text) > 10:
-        skills = skills_text
+        raw_skills = skills_text
     # Fallback: look for lines with many technical keywords (simple heuristic)
-    if skills == "Information not found":
+    if raw_skills == "Information not found":
         tech_keywords = ['c#', 'python', 'java', 'c++', 'sql', 'asp.net', 'mvc', 'git', 'github', 'api', 'rest', 'entity framework', 'data structures', 'algorithms']
         skill_candidates = []
         for line in raw_lines:
@@ -232,7 +277,9 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
             if len(line) < 200 and any(kw in line_lower for kw in tech_keywords):
                 skill_candidates.append(line)
         if len(skill_candidates) > 0:
-            skills = '\n'.join(skill_candidates)
+            raw_skills = '\n'.join(skill_candidates)
+    # Filter skills to keep only known ones
+    filtered_skills = extract_known_skills(raw_skills)
 
     # --- 6. Extract Education Details ---
     education = "Information not found"
@@ -260,7 +307,8 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
         "age": final_age,
         "years_of_experience": final_exp,
         "address": address,
-        "skills_extracted": skills,
+        "skills_extracted": raw_skills,
+        "skills_extracted_filtered": filtered_skills,
         "highest_education": highest_education,
         "education_details_extracted": education,
         "full_text": full_text
