@@ -171,12 +171,9 @@ def extract_known_skills(text: str):
     text_lower = text.lower()
     
     for skill in COMMON_SKILLS:
-        # Use word boundaries to match whole skill only
-        # Escape special characters in skill name (like C# becomes C\#)
         skill_lower = skill.lower()
-        # Check if skill exists as whole word in text
-        pattern = r'\b' + re.escape(skill_lower) + r'\b'
-        if re.search(pattern, text_lower):
+        pattern = r'(?<![a-z0-9])' + re.escape(skill_lower) + r'(?![a-z0-9])'
+        if re.search(pattern, text_lower, flags=re.IGNORECASE):
             found_skills.append(skill)
     
     if found_skills:
@@ -209,48 +206,59 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
     def get_section_text(start_keywords: list, end_keywords: list):
         start_idx = None
         end_idx = None
-        
+        start_inline_text = ""
+
+        def match_start(line_text: str, keyword: str) -> Optional[str]:
+            m = re.match(r'^\s*' + re.escape(keyword) + r'\s*[:\-–—]?\s*(.*)$', line_text, flags=re.IGNORECASE)
+            if not m:
+                return None
+            return (m.group(1) or "").strip()
+
+        def is_end_header(line_text: str, keyword: str) -> bool:
+            return re.match(r'^\s*' + re.escape(keyword) + r'\s*[:\-–—]?\s*$', line_text, flags=re.IGNORECASE) is not None
+
         for i, line in enumerate(raw_lines):
-            line_lower = line.lower()
-            # Find start of section - look for exact keyword matches
-            for kw in start_keywords:
-                kw_lower = kw.lower()
-                # Check if the line is exactly the keyword or starts with it (like "SKILLS" or "Skills:")
-                if kw_lower in line_lower and len(line_lower) < 50:
-                    if start_idx is None:
+            if start_idx is None:
+                for kw in start_keywords:
+                    remainder = match_start(line, kw)
+                    if remainder is not None:
                         start_idx = i
+                        start_inline_text = remainder
                         break
-            # Find end of section (only if we found start)
-            if start_idx is not None and i > start_idx:
-                for kw in end_keywords:
-                    kw_lower = kw.lower()
-                    if kw_lower in line_lower and len(line_lower) < 50:
-                        end_idx = i
-                        break
-                if end_idx:
+                continue
+
+            for kw in end_keywords:
+                if is_end_header(line, kw):
+                    end_idx = i
                     break
-        
-        # If start found, collect text
-        if start_idx is not None:
-            if end_idx is None:
-                return '\n'.join(raw_lines[start_idx+1:])
-            else:
-                return '\n'.join(raw_lines[start_idx+1:end_idx])
-        return None
+            if end_idx is not None:
+                break
+
+        if start_idx is None:
+            return None
+
+        body_lines = []
+        if start_inline_text:
+            body_lines.append(start_inline_text)
+
+        body_slice = raw_lines[start_idx + 1:] if end_idx is None else raw_lines[start_idx + 1:end_idx]
+        body_lines.extend(body_slice)
+
+        return "\n".join([l for l in body_lines if l.strip()]) or None
 
     # --- All possible section keywords (for any format) ---
     skill_section_headers = [
-        'Skills', 'Technical Skills', 'Technologies', 'Tech Stack', 
-        'Core Competencies', 'Technical Expertise', 'Technical Skills:'
+        'Skills', 'Technical Skills', 'Technologies', 'Tech Stack',
+        'Core Competencies', 'Technical Expertise'
     ]
     education_section_headers = [
-        'Education', 'Academic Background', 'Qualifications', 'Academic', 'Education:', 'Academic Background:'
+        'Education', 'Academic Background', 'Qualifications', 'Academic'
     ]
     experience_section_headers = [
-        'Experience', 'Work Experience', 'Employment History', 'Work History', 'Professional Experience', 'Experience:'
+        'Experience', 'Work Experience', 'Employment History', 'Work History', 'Professional Experience'
     ]
     all_section_headers = skill_section_headers + education_section_headers + experience_section_headers + [
-        'Projects', 'Certifications', 'Certificates', 'Summary', 'Objective', 
+        'Projects', 'Certifications', 'Certificates', 'Summary', 'Objective',
         'Extracurricular', 'Languages', 'Contact', 'Personal', 'Address', 'Location'
     ]
 
@@ -301,8 +309,10 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
 
     # --- 5. Extract Skills (raw + filtered) ---
     raw_skills = "Information not found"
-    # For skills, end keywords exclude other skill headers (so it doesn't stop at "Technical Skills")
-    skill_end_keywords = [kw for kw in all_section_headers if kw not in skill_section_headers]
+    skill_end_keywords = [
+        'Education', 'Experience', 'Work Experience', 'Employment History', 'Work History', 'Professional Experience',
+        'Projects', 'Certifications', 'Certificates', 'Summary', 'Objective', 'Extracurricular'
+    ]
     skills_text = get_section_text(skill_section_headers, skill_end_keywords)
     if skills_text and len(skills_text) > 10:
         raw_skills = skills_text
