@@ -188,14 +188,22 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     current_year = 2026
 
-    # --- Step 1: Extract all text first (simple and safe) ---
-    full_text = ""
+    # --- Step 1: Extract all text and line info ---
+    raw_lines = []
+    full_text_parts = []
+    
     for page in doc:
-        full_text += page.get_text()
-    # Clean up the full text a bit
-    full_text = re.sub(r'\n+', '\n', full_text).strip()
-    # Also get lines separated by newlines for section detection
-    raw_lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+        # Get text as dictionary with word-level info
+        blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
+            if block.get("type") == 0:  # text block
+                for line in block["lines"]:
+                    line_text = " ".join([span["text"] for span in line["spans"]]).strip()
+                    if line_text:
+                        raw_lines.append(line_text)
+                        full_text_parts.append(line_text)
+    
+    full_text = ' '.join(full_text_parts)
 
     # --- Helper: Find a section and get text until next section ---
     def get_section_text(start_keywords: list, end_keywords: list):
@@ -204,14 +212,23 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
         
         for i, line in enumerate(raw_lines):
             line_lower = line.lower()
-            # Find start of section
-            if any(kw.lower() in line_lower for kw in start_keywords):
-                if start_idx is None:
-                    start_idx = i
+            # Find start of section - look for exact keyword matches
+            for kw in start_keywords:
+                kw_lower = kw.lower()
+                # Check if the line is exactly the keyword or starts with it (like "SKILLS" or "Skills:")
+                if kw_lower in line_lower and len(line_lower) < 50:
+                    if start_idx is None:
+                        start_idx = i
+                        break
             # Find end of section (only if we found start)
-            elif start_idx is not None and any(kw.lower() in line_lower for kw in end_keywords):
-                end_idx = i
-                break
+            if start_idx is not None and i > start_idx:
+                for kw in end_keywords:
+                    kw_lower = kw.lower()
+                    if kw_lower in line_lower and len(line_lower) < 50:
+                        end_idx = i
+                        break
+                if end_idx:
+                    break
         
         # If start found, collect text
         if start_idx is not None:
