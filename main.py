@@ -103,7 +103,7 @@ class RankingRequest(BaseModel):
     job_post: JobPostData
     applicants: List[CandidateData]
 
-# --- تحويل ExperienceLevel إلى رقم ---
+# --- تحويل ExperienceLevel إلى رقم (الاصلي) ---
 def experience_level_to_years(level: str) -> int:
     level_map = {
         "Entry": 0,
@@ -111,6 +111,42 @@ def experience_level_to_years(level: str) -> int:
         "Senior": 5
     }
     return level_map.get(level, 0)
+
+# --- تحويل ExperienceLevel أو Range إلى أرقام أو نطاق (حصرًا 3 زي الصورة) ---
+def parse_experience_requirement(exp_req: str) -> tuple[int, int]:
+  
+    exp_req = str(exp_req).strip().lower()
+    
+    # أولاً: نحدد بالضبط زي الصورة
+    if "entry" in exp_req or "0-2" in exp_req:
+        return (0, 2)
+    elif "mid" in exp_req or "3-5" in exp_req:
+        return (3, 5)
+    elif "senior" in exp_req or "5+" in exp_req:
+        return (5, 99)
+    
+    # الافتراضي لو مش لاقى
+    return (0, 99)
+
+def calculate_experience_match_score(candidate_exp: int, exp_req: str) -> float:
+    """
+    حساب درجة مطابقة الخبرة (حسب الـ 3 Ranges):
+    - 1.0 لو الخبرة في أو أعلى النطاق المطلوب
+    - 0.7 لو أقل بسنة
+    - 0.4 لو أقل بسنتين
+    - أقل من كده → 0.0
+    """
+    min_exp, max_exp = parse_experience_requirement(exp_req)
+    candidate_exp = max(0, int(candidate_exp))
+    
+    if candidate_exp >= min_exp:
+        return 1.0
+    elif candidate_exp >= min_exp - 1:
+        return 0.7
+    elif candidate_exp >= min_exp - 2:
+        return 0.4
+    else:
+        return 0.0
 
 # --- دالات الخدمة ---
 def deep_clean_text(text):
@@ -122,6 +158,76 @@ def deep_clean_text(text):
     words = text.split()
     clean_words = [w for w in words if w not in stop_words]
     return " ".join(clean_words)
+
+def clamp_number(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return float(default)
+    if v < low:
+        return float(low)
+    if v > high:
+        return float(high)
+    return float(v)
+
+def normalize_location(value: str) -> str:
+    if not value:
+        return ""
+    s = str(value).lower()
+    s = s.replace("–", "-").replace("—", "-").replace("|", ",").replace("⋄", ",")
+    s = re.sub(r"[^0-9\w\s,/-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def location_match_score(candidate_address: str, job_location: str) -> float:
+    cand = normalize_location(candidate_address)
+    job = normalize_location(job_location)
+    if not cand or not job:
+        return 0.0
+    if "remote" in job or "hybrid" in job:
+        return 0.0
+
+    stop = {
+        "in", "at", "from", "to",
+        "area", "city", "governorate", "province", "state", "country",
+        "street", "st", "road", "rd", "ave", "avenue",
+        "egypt", "eg", "ksa", "uae", "saudi", "arabia",
+        "onsite", "on", "site", "on-site",
+    }
+
+    def to_tokens(s: str) -> set:
+        parts = []
+        for chunk in re.split(r"[,/;-]+", s):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            parts.extend([p for p in chunk.split() if p])
+        tokens = set()
+        for p in parts:
+            if p in stop:
+                continue
+            if len(p) < 2:
+                continue
+            tokens.add(p)
+        return tokens
+
+    cand_tokens = to_tokens(cand)
+    job_tokens = to_tokens(job)
+    if not cand_tokens or not job_tokens:
+        return 0.0
+
+    if cand_tokens.intersection(job_tokens):
+        return 1.0
+
+    cand_str = " " + cand + " "
+    job_str = " " + job + " "
+    for t in cand_tokens:
+        if (" " + t + " ") in job_str:
+            return 0.5
+    for t in job_tokens:
+        if (" " + t + " ") in cand_str:
+            return 0.5
+    return 0.0
 
 # --- Common known skills list (you can add more!) ---
 COMMON_SKILLS = [
@@ -387,7 +493,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     
     cv_emb = sbert_model.encode(cv_text_combined, convert_to_tensor=True)
     job_emb = sbert_model.encode(job_text, convert_to_tensor=True)
-    semantic_sim = util.cos_sim(cv_emb, job_emb).item()
+    semantic_sim = clamp_number(util.cos_sim(cv_emb, job_emb).item(), -1.0, 1.0, 0.0)
 
     # 2. مطابقة الكلمات المفتاحية للعنوان
     target_role = job_post.title.lower()
@@ -396,16 +502,25 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     
     title_match_count = sum(1 for kw in title_keywords if kw in (candidate.full_text or "").lower() or kw in (candidate.skills_extracted or "").lower())
     title_match_ratio = title_match_count / len(title_keywords) if title_keywords else 1.0
+    title_match_ratio = clamp_number(title_match_ratio, 0.0, 1.0, 0.0)
     
     # 3. مطابقة المهارات
-    req_skills = set([s.strip().lower() for s in (job_post.required_skills or "").split(',') if s.strip()])
-    cv_skills_set = set(deep_clean_text(candidate.skills_extracted or "").split())
-    skill_ratio = len(cv_skills_set.intersection(req_skills)) / len(req_skills) if req_skills else 0.5
+    req_skill_items = [deep_clean_text(s.strip()) for s in (job_post.required_skills or "").split(",") if s.strip()]
+    req_skill_items = [s for s in req_skill_items if s]
+    candidate_skills_blob = deep_clean_text(candidate.skills_extracted or "")
+    if req_skill_items:
+        matched_count = sum(1 for s in req_skill_items if s in candidate_skills_blob)
+        skill_ratio = matched_count / len(req_skill_items)
+    else:
+        skill_ratio = 0.5
+    skill_ratio = clamp_number(skill_ratio, 0.0, 1.0, 0.5)
 
     # 4. مطابقة العمر (Range)
-    age = candidate.age or 25
-    min_age = job_post.min_age or 18
-    max_age = job_post.max_age or 60
+    age = clamp_number(candidate.age if candidate.age is not None else 25, 16.0, 80.0, 25.0)
+    min_age = clamp_number(job_post.min_age if job_post.min_age is not None else 18, 16.0, 80.0, 18.0)
+    max_age = clamp_number(job_post.max_age if job_post.max_age is not None else 60, 16.0, 80.0, 60.0)
+    if max_age < min_age:
+        min_age, max_age = max_age, min_age
     if min_age <= age <= max_age:
         age_match_score = 1.0
     elif age < min_age:
@@ -413,11 +528,19 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     else:
         age_match_score = max(0, 1 - (age - max_age) / 10)
 
-    # 5. مطابقة الخبرة
-    exp_candidate = candidate.years_of_experience or 0
-    exp_required = experience_level_to_years(job_post.experience_level or "Entry")
-    exp_diff = exp_candidate - exp_required
-    experience_match_score = max(0, min(1.0, 0.5 + exp_diff / 5))
+    # 5. مطابقة الخبرة (Range Logic + Original Model Compatibility)
+    exp_candidate = clamp_number(candidate.years_of_experience if candidate.years_of_experience is not None else 0, 0.0, 60.0, 0.0)
+    
+    # لحساب الـ Experience Match Score (بالـ Ranges)
+    experience_match_score = calculate_experience_match_score(int(exp_candidate), job_post.experience_level or "Entry")
+    
+    # لحساب الـ exp_diff للـ Model (زي الأصل)
+    min_exp, max_exp = parse_experience_requirement(job_post.experience_level or "Entry")
+    exp_required_legacy = experience_level_to_years(job_post.experience_level or "Entry")
+    exp_diff = clamp_number(exp_candidate - exp_required_legacy, -60.0, 60.0, 0.0)
+
+    loc_score = location_match_score(candidate.address or "", job_post.location or "")
+    location_bonus = 0.03 * loc_score
 
     # 6. التنبؤ باستخدام النموذج
     selected_title = job_post.title
@@ -428,7 +551,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         semantic_sim, skill_ratio, title_match_ratio, 
         float(age), float(exp_candidate), 
         float(exp_diff),
-        float(age - (min_age + max_age)/2),
+        float(clamp_number(age - (min_age + max_age)/2, -80.0, 80.0, 0.0)),
         float(job_cat)
     ]])
     
@@ -439,7 +562,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     skill_bonus = 0.2 if skill_ratio > 0.7 else 0.0
     domain_penalty = 0.4 if title_match_ratio < 0.4 else 0.0
     
-    final_score_raw = (model_score * 0.4) + (skill_ratio * 0.3) + (title_match_ratio * 0.3) + domain_bonus + skill_bonus - domain_penalty
+    final_score_raw = (model_score * 0.4) + (skill_ratio * 0.3) + (title_match_ratio * 0.3) + domain_bonus + skill_bonus - domain_penalty + location_bonus
     final_score_raw *= (0.7 * age_match_score + 0.3 * experience_match_score)
     final_pct = max(0, min(100.0, final_score_raw * 100))
 
