@@ -84,6 +84,7 @@ class JobPostData(BaseModel):
 
 class MatchScoreResponse(BaseModel):
     final_score: float
+    model_score: float
     skill_match_ratio: float
     title_match_ratio: float
     semantic_similarity: float
@@ -557,17 +558,15 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     
     model_score = model.predict(features)[0]
 
-    # منطق المجال
-    domain_bonus = 0.2 if title_match_ratio > 0.6 else 0.0
-    skill_bonus = 0.2 if skill_ratio > 0.7 else 0.0
-    domain_penalty = 0.4 if title_match_ratio < 0.4 else 0.0
+    # بونص صغير لـ job title match
+    title_bonus = 0.05 if title_match_ratio > 0.6 else 0.0  # 5% bonus if title matches more than 60%
     
-    final_score_raw = (model_score * 0.4) + (skill_ratio * 0.3) + (title_match_ratio * 0.3) + domain_bonus + skill_bonus - domain_penalty + location_bonus
-    final_score_raw *= (0.7 * age_match_score + 0.3 * experience_match_score)
+    final_score_raw = model_score + title_bonus
     final_pct = max(0, min(100.0, final_score_raw * 100))
 
     return {
         "final_score": final_pct,
+        "model_score": model_score * 100,
         "skill_match_ratio": skill_ratio,
         "title_match_ratio": title_match_ratio,
         "semantic_similarity": semantic_sim,
