@@ -568,7 +568,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
 
     # --- Add reasonable manual bonuses/penalties
     # Small title match bonus (max +7% if perfect title match
-    title_bonus = 0.07 if title_match_ratio == 1.0 else 0.0
+    title_bonus = 0.15 if title_match_ratio == 1.0 else 0.0
 
     # Location match bonus (max +5% if addresses match
     loc_bonus = 0.05 if loc_score > 0.5 else 0.0
