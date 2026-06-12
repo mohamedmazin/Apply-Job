@@ -572,7 +572,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     scaled_model_score = (model_score * 0.93) + 0.07
 
     # --- Add reasonable manual bonuses/penalties
-    title_bonus = 0.07 if title_match_ratio == 1.0 else 0.0
+    title_bonus = 0.15 if title_match_ratio == 1.0 else 0.0
     loc_bonus = 0.05 if loc_score > 0.5 else 0.0
 
     final_score_raw = scaled_model_score + title_bonus + loc_bonus
