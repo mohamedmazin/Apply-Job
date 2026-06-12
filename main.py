@@ -103,7 +103,7 @@ class RankingRequest(BaseModel):
     job_post: JobPostData
     applicants: List[CandidateData]
 
-# --- تحويل ExperienceLevel إلى رقم ---
+# --- تحويل ExperienceLevel إلى رقم (الاصلي) ---
 def experience_level_to_years(level: str) -> int:
     level_map = {
         "Entry": 0,
@@ -111,6 +111,42 @@ def experience_level_to_years(level: str) -> int:
         "Senior": 5
     }
     return level_map.get(level, 0)
+
+# --- تحويل ExperienceLevel أو Range إلى أرقام أو نطاق (حصرًا 3 زي الصورة) ---
+def parse_experience_requirement(exp_req: str) -> tuple[int, int]:
+  
+    exp_req = str(exp_req).strip().lower()
+    
+    # أولاً: نحدد بالضبط زي الصورة
+    if "entry" in exp_req or "0-2" in exp_req:
+        return (0, 2)
+    elif "mid" in exp_req or "3-5" in exp_req:
+        return (3, 5)
+    elif "senior" in exp_req or "5+" in exp_req:
+        return (5, 99)
+    
+    # الافتراضي لو مش لاقى
+    return (0, 99)
+
+def calculate_experience_match_score(candidate_exp: int, exp_req: str) -> float:
+    """
+    حساب درجة مطابقة الخبرة (حسب الـ 3 Ranges):
+    - 1.0 لو الخبرة في أو أعلى النطاق المطلوب
+    - 0.7 لو أقل بسنة
+    - 0.4 لو أقل بسنتين
+    - أقل من كده → 0.0
+    """
+    min_exp, max_exp = parse_experience_requirement(exp_req)
+    candidate_exp = max(0, int(candidate_exp))
+    
+    if candidate_exp >= min_exp:
+        return 1.0
+    elif candidate_exp >= min_exp - 1:
+        return 0.7
+    elif candidate_exp >= min_exp - 2:
+        return 0.4
+    else:
+        return 0.0
 
 # --- دالات الخدمة ---
 def deep_clean_text(text):
@@ -122,6 +158,76 @@ def deep_clean_text(text):
     words = text.split()
     clean_words = [w for w in words if w not in stop_words]
     return " ".join(clean_words)
+
+def clamp_number(value: Any, low: float, high: float, default: float) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return float(default)
+    if v < low:
+        return float(low)
+    if v > high:
+        return float(high)
+    return float(v)
+
+def normalize_location(value: str) -> str:
+    if not value:
+        return ""
+    s = str(value).lower()
+    s = s.replace("–", "-").replace("—", "-").replace("|", ",").replace("⋄", ",")
+    s = re.sub(r"[^0-9\w\s,/-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def location_match_score(candidate_address: str, job_location: str) -> float:
+    cand = normalize_location(candidate_address)
+    job = normalize_location(job_location)
+    if not cand or not job:
+        return 0.0
+    if "remote" in job or "hybrid" in job:
+        return 0.0
+
+    stop = {
+        "in", "at", "from", "to",
+        "area", "city", "governorate", "province", "state", "country",
+        "street", "st", "road", "rd", "ave", "avenue",
+        "egypt", "eg", "ksa", "uae", "saudi", "arabia",
+        "onsite", "on", "site", "on-site",
+    }
+
+    def to_tokens(s: str) -> set:
+        parts = []
+        for chunk in re.split(r"[,/;-]+", s):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            parts.extend([p for p in chunk.split() if p])
+        tokens = set()
+        for p in parts:
+            if p in stop:
+                continue
+            if len(p) < 2:
+                continue
+            tokens.add(p)
+        return tokens
+
+    cand_tokens = to_tokens(cand)
+    job_tokens = to_tokens(job)
+    if not cand_tokens or not job_tokens:
+        return 0.0
+
+    if cand_tokens.intersection(job_tokens):
+        return 1.0
+
+    cand_str = " " + cand + " "
+    job_str = " " + job + " "
+    for t in cand_tokens:
+        if (" " + t + " ") in job_str:
+            return 0.5
+    for t in job_tokens:
+        if (" " + t + " ") in cand_str:
+            return 0.5
+    return 0.0
 
 # --- Common known skills list (you can add more!) ---
 COMMON_SKILLS = [
@@ -171,12 +277,9 @@ def extract_known_skills(text: str):
     text_lower = text.lower()
     
     for skill in COMMON_SKILLS:
-        # Use word boundaries to match whole skill only
-        # Escape special characters in skill name (like C# becomes C\#)
         skill_lower = skill.lower()
-        # Check if skill exists as whole word in text
-        pattern = r'\b' + re.escape(skill_lower) + r'\b'
-        if re.search(pattern, text_lower):
+        pattern = r'(?<![a-z0-9])' + re.escape(skill_lower) + r'(?![a-z0-9])'
+        if re.search(pattern, text_lower, flags=re.IGNORECASE):
             found_skills.append(skill)
     
     if found_skills:
@@ -209,48 +312,59 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
     def get_section_text(start_keywords: list, end_keywords: list):
         start_idx = None
         end_idx = None
-        
+        start_inline_text = ""
+
+        def match_start(line_text: str, keyword: str) -> Optional[str]:
+            m = re.match(r'^\s*' + re.escape(keyword) + r'\s*[:\-–—]?\s*(.*)$', line_text, flags=re.IGNORECASE)
+            if not m:
+                return None
+            return (m.group(1) or "").strip()
+
+        def is_end_header(line_text: str, keyword: str) -> bool:
+            return re.match(r'^\s*' + re.escape(keyword) + r'\s*[:\-–—]?\s*$', line_text, flags=re.IGNORECASE) is not None
+
         for i, line in enumerate(raw_lines):
-            line_lower = line.lower()
-            # Find start of section - look for exact keyword matches
-            for kw in start_keywords:
-                kw_lower = kw.lower()
-                # Check if the line is exactly the keyword or starts with it (like "SKILLS" or "Skills:")
-                if kw_lower in line_lower and len(line_lower) < 50:
-                    if start_idx is None:
+            if start_idx is None:
+                for kw in start_keywords:
+                    remainder = match_start(line, kw)
+                    if remainder is not None:
                         start_idx = i
+                        start_inline_text = remainder
                         break
-            # Find end of section (only if we found start)
-            if start_idx is not None and i > start_idx:
-                for kw in end_keywords:
-                    kw_lower = kw.lower()
-                    if kw_lower in line_lower and len(line_lower) < 50:
-                        end_idx = i
-                        break
-                if end_idx:
+                continue
+
+            for kw in end_keywords:
+                if is_end_header(line, kw):
+                    end_idx = i
                     break
-        
-        # If start found, collect text
-        if start_idx is not None:
-            if end_idx is None:
-                return '\n'.join(raw_lines[start_idx+1:])
-            else:
-                return '\n'.join(raw_lines[start_idx+1:end_idx])
-        return None
+            if end_idx is not None:
+                break
+
+        if start_idx is None:
+            return None
+
+        body_lines = []
+        if start_inline_text:
+            body_lines.append(start_inline_text)
+
+        body_slice = raw_lines[start_idx + 1:] if end_idx is None else raw_lines[start_idx + 1:end_idx]
+        body_lines.extend(body_slice)
+
+        return "\n".join([l for l in body_lines if l.strip()]) or None
 
     # --- All possible section keywords (for any format) ---
     skill_section_headers = [
-        'Skills', 'Technical Skills', 'Technologies', 'Tech Stack', 
-        'Core Competencies', 'Technical Expertise', 'Technical Skills:'
+        'Skills', 'Technical Skills', 'Technologies', 'Tech Stack',
+        'Core Competencies', 'Technical Expertise'
     ]
     education_section_headers = [
-        'Education', 'Academic Background', 'Qualifications', 'Academic', 'Education:', 'Academic Background:'
+        'Education', 'Academic Background', 'Qualifications', 'Academic'
     ]
     experience_section_headers = [
-        'Experience', 'Work Experience', 'Employment History', 'Work History', 'Professional Experience', 'Experience:'
+        'Experience', 'Work Experience', 'Employment History', 'Work History', 'Professional Experience'
     ]
     all_section_headers = skill_section_headers + education_section_headers + experience_section_headers + [
-        'Projects', 'Certifications', 'Certificates', 'Summary', 'Objective', 
+        'Projects', 'Certifications', 'Certificates', 'Summary', 'Objective',
         'Extracurricular', 'Languages', 'Contact', 'Personal', 'Address', 'Location'
     ]
 
@@ -301,8 +415,10 @@ def extract_full_cv_data_from_pdf(pdf_bytes: bytes, filename: str):
 
     # --- 5. Extract Skills (raw + filtered) ---
     raw_skills = "Information not found"
-    # For skills, end keywords exclude other skill headers (so it doesn't stop at "Technical Skills")
-    skill_end_keywords = [kw for kw in all_section_headers if kw not in skill_section_headers]
+    skill_end_keywords = [
+        'Education', 'Experience', 'Work Experience', 'Employment History', 'Work History', 'Professional Experience',
+        'Projects', 'Certifications', 'Certificates', 'Summary', 'Objective', 'Extracurricular'
+    ]
     skills_text = get_section_text(skill_section_headers, skill_end_keywords)
     if skills_text and len(skills_text) > 10:
         raw_skills = skills_text
@@ -377,7 +493,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     
     cv_emb = sbert_model.encode(cv_text_combined, convert_to_tensor=True)
     job_emb = sbert_model.encode(job_text, convert_to_tensor=True)
-    semantic_sim = util.cos_sim(cv_emb, job_emb).item()
+    semantic_sim = clamp_number(util.cos_sim(cv_emb, job_emb).item(), -1.0, 1.0, 0.0)
 
     # 2. مطابقة الكلمات المفتاحية للعنوان
     target_role = job_post.title.lower()
@@ -386,16 +502,25 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     
     title_match_count = sum(1 for kw in title_keywords if kw in (candidate.full_text or "").lower() or kw in (candidate.skills_extracted or "").lower())
     title_match_ratio = title_match_count / len(title_keywords) if title_keywords else 1.0
+    title_match_ratio = clamp_number(title_match_ratio, 0.0, 1.0, 0.0)
     
     # 3. مطابقة المهارات
-    req_skills = set([s.strip().lower() for s in (job_post.required_skills or "").split(',') if s.strip()])
-    cv_skills_set = set(deep_clean_text(candidate.skills_extracted or "").split())
-    skill_ratio = len(cv_skills_set.intersection(req_skills)) / len(req_skills) if req_skills else 0.5
+    req_skill_items = [deep_clean_text(s.strip()) for s in (job_post.required_skills or "").split(",") if s.strip()]
+    req_skill_items = [s for s in req_skill_items if s]
+    candidate_skills_blob = deep_clean_text(candidate.skills_extracted or "")
+    if req_skill_items:
+        matched_count = sum(1 for s in req_skill_items if s in candidate_skills_blob)
+        skill_ratio = matched_count / len(req_skill_items)
+    else:
+        skill_ratio = 0.5
+    skill_ratio = clamp_number(skill_ratio, 0.0, 1.0, 0.5)
 
     # 4. مطابقة العمر (Range)
-    age = candidate.age or 25
-    min_age = job_post.min_age or 18
-    max_age = job_post.max_age or 60
+    age = clamp_number(candidate.age if candidate.age is not None else 25, 16.0, 80.0, 25.0)
+    min_age = clamp_number(job_post.min_age if job_post.min_age is not None else 18, 16.0, 80.0, 18.0)
+    max_age = clamp_number(job_post.max_age if job_post.max_age is not None else 60, 16.0, 80.0, 60.0)
+    if max_age < min_age:
+        min_age, max_age = max_age, min_age
     if min_age <= age <= max_age:
         age_match_score = 1.0
     elif age < min_age:
@@ -403,11 +528,19 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     else:
         age_match_score = max(0, 1 - (age - max_age) / 10)
 
-    # 5. مطابقة الخبرة
-    exp_candidate = candidate.years_of_experience or 0
-    exp_required = experience_level_to_years(job_post.experience_level or "Entry")
-    exp_diff = exp_candidate - exp_required
-    experience_match_score = max(0, min(1.0, 0.5 + exp_diff / 5))
+    # 5. مطابقة الخبرة (Range Logic + Original Model Compatibility)
+    exp_candidate = clamp_number(candidate.years_of_experience if candidate.years_of_experience is not None else 0, 0.0, 60.0, 0.0)
+    
+    # لحساب الـ Experience Match Score (بالـ Ranges)
+    experience_match_score = calculate_experience_match_score(int(exp_candidate), job_post.experience_level or "Entry")
+    
+    # لحساب الـ exp_diff للـ Model (زي الأصل)
+    min_exp, max_exp = parse_experience_requirement(job_post.experience_level or "Entry")
+    exp_required_legacy = experience_level_to_years(job_post.experience_level or "Entry")
+    exp_diff = clamp_number(exp_candidate - exp_required_legacy, -60.0, 60.0, 0.0)
+
+    loc_score = location_match_score(candidate.address or "", job_post.location or "")
+    location_bonus = 0.03 * loc_score
 
     # 6. التنبؤ باستخدام النموذج
     selected_title = job_post.title
@@ -418,7 +551,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         semantic_sim, skill_ratio, title_match_ratio, 
         float(age), float(exp_candidate), 
         float(exp_diff),
-        float(age - (min_age + max_age)/2),
+        float(clamp_number(age - (min_age + max_age)/2, -80.0, 80.0, 0.0)),
         float(job_cat)
     ]])
     
@@ -429,7 +562,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     skill_bonus = 0.2 if skill_ratio > 0.7 else 0.0
     domain_penalty = 0.4 if title_match_ratio < 0.4 else 0.0
     
-    final_score_raw = (model_score * 0.4) + (skill_ratio * 0.3) + (title_match_ratio * 0.3) + domain_bonus + skill_bonus - domain_penalty
+    final_score_raw = (model_score * 0.4) + (skill_ratio * 0.3) + (title_match_ratio * 0.3) + domain_bonus + skill_bonus - domain_penalty + location_bonus
     final_score_raw *= (0.7 * age_match_score + 0.3 * experience_match_score)
     final_pct = max(0, min(100.0, final_score_raw * 100))
 
