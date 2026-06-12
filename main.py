@@ -530,22 +530,28 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         min_age, max_age = max_age, min_age
     
     age_requirement = (min_age + max_age) / 2.0
-    
+
+    # --- If age is inside the acceptable range, set age_diff to 0!
     if min_age <= age <= max_age:
-        age_match_score = 1.0
-    elif age < min_age:
-        age_match_score = max(0, 1 - (min_age - age) / 10)
+        age_diff = 0.0
     else:
-        age_match_score = max(0, 1 - (age - max_age) / 10)
+        age_diff = age - age_requirement
+
+    age_match_score = 1.0 if min_age <= age <= max_age else (max(0, 1 - (min_age - age)/10) if age < min_age else max(0, 1 - (age - max_age)/10))
 
     # 5. مطابقة الخبرة (Range Logic + Original Model Compatibility)
     exp_candidate = clamp_number(candidate.years_of_experience if candidate.years_of_experience is not None else 0, 0.0, 60.0, 0.0)
-    
+
     experience_match_score = calculate_experience_match_score(int(exp_candidate), job_post.experience_level or "Entry")
-    
+
     min_exp, max_exp = parse_experience_requirement(job_post.experience_level or "Entry")
     exp_required_legacy = experience_level_to_years(job_post.experience_level or "Entry")
-    exp_diff = clamp_number(exp_candidate - exp_required_legacy, -60.0, 60.0, 0.0)
+
+    # --- If experience >= min_exp, set exp_diff to 0!
+    if exp_candidate >= min_exp:
+        exp_diff = 0.0
+    else:
+        exp_diff = clamp_number(exp_candidate - exp_required_legacy, -60.0, 60.0, 0.0)
 
     loc_score = location_match_score(candidate.address or "", job_post.location or "")
 
@@ -561,7 +567,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         float(age),
         float(exp_candidate),
         float(exp_diff),
-        float(age - age_requirement),  # زي التدريب!
+        float(age_diff),  # Now using our fixed age_diff!
         float(job_cat)
     ]])
     
