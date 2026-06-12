@@ -87,6 +87,7 @@ class JobPostData(BaseModel):
 class MatchScoreResponse(BaseModel):
     final_score: float
     model_score: float
+    scaled_model_score: float
     skill_match_ratio: float
     title_match_ratio: float
     semantic_similarity: float
@@ -566,20 +567,22 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     
     model_score = model.predict(features)[0]
 
-    # --- Add reasonable manual bonuses/penalties
-    # Small title match bonus (max +7% if perfect title match
-    title_bonus = 0.15 if title_match_ratio == 1.0 else 0.0
+    # --- Slightly scale model score to give a boost (make it more "optimistic")
+    # Scale from [0, 1] to [0.05, 0.98] then add 8 points, then clamp!
+    scaled_model_score = (model_score * 0.93) + 0.07
 
-    # Location match bonus (max +5% if addresses match
+    # --- Add reasonable manual bonuses/penalties
+    title_bonus = 0.07 if title_match_ratio == 1.0 else 0.0
     loc_bonus = 0.05 if loc_score > 0.5 else 0.0
 
-    final_score_raw = model_score + title_bonus + loc_bonus
+    final_score_raw = scaled_model_score + title_bonus + loc_bonus
 
     final_pct = max(0, min(100.0, final_score_raw * 100))
 
     return {
         "final_score": final_pct,
         "model_score": model_score * 100,
+        "scaled_model_score": scaled_model_score * 100,
         "skill_match_ratio": skill_ratio,
         "title_match_ratio": title_match_ratio,
         "semantic_similarity": semantic_sim,
