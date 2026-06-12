@@ -52,6 +52,8 @@ TRAINED_JOB_CATEGORIES = [
 TECH_JOB_MAPPING = {
     "Frontend Developer": "Senior Software Engineer",
     "Backend Developer": "Senior Software Engineer",
+    "Back-End": "Senior Software Engineer",
+    ".NET Developer": "Senior Software Engineer",
     "Mobile Developer (Android/iOS)": "Senior iOS Engineer",
     "Flutter Developer": "Senior iOS Engineer",
     "React Native Developer": "Senior iOS Engineer",
@@ -496,7 +498,7 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     job_emb = sbert_model.encode(job_text, convert_to_tensor=True)
     semantic_sim = clamp_number(util.cos_sim(cv_emb, job_emb).item(), -1.0, 1.0, 0.0)
 
-    # 2. مطابقة الكلمات المفتاحية للعنوان
+    # 2. مطابقة الكلمات المفتاحية للعنوان (Binary 0 or 1 زي التدريب)
     target_role = job_post.title.lower()
     clean_title = re.sub(r'[\(\)/]', ' ', target_role)
     title_keywords = [w for w in clean_title.split() if len(w) > 2 and w not in ["and", "the", "for"]]
@@ -504,8 +506,9 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     title_match_count = sum(1 for kw in title_keywords if kw in (candidate.full_text or "").lower() or kw in (candidate.skills_extracted or "").lower())
     title_match_ratio = title_match_count / len(title_keywords) if title_keywords else 1.0
     title_match_ratio = clamp_number(title_match_ratio, 0.0, 1.0, 0.0)
+    title_match = 1.0 if title_match_ratio >= 0.5 else 0.0
     
-    # 3. مطابقة المهارات
+    # 3. مطابقة المهارات (زي ما هو)
     req_skill_items = [deep_clean_text(s.strip()) for s in (job_post.required_skills or "").split(",") if s.strip()]
     req_skill_items = [s for s in req_skill_items if s]
     candidate_skills_blob = deep_clean_text(candidate.skills_extracted or "")
@@ -516,12 +519,15 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         skill_ratio = 0.5
     skill_ratio = clamp_number(skill_ratio, 0.0, 1.0, 0.5)
 
-    # 4. مطابقة العمر (Range)
+    # 4. مطابقة العمر (Calculate single age_requirement زي التدريب)
     age = clamp_number(candidate.age if candidate.age is not None else 25, 16.0, 80.0, 25.0)
     min_age = clamp_number(job_post.min_age if job_post.min_age is not None else 18, 16.0, 80.0, 18.0)
     max_age = clamp_number(job_post.max_age if job_post.max_age is not None else 60, 16.0, 80.0, 60.0)
     if max_age < min_age:
         min_age, max_age = max_age, min_age
+    
+    age_requirement = (min_age + max_age) / 2.0
+    
     if min_age <= age <= max_age:
         age_match_score = 1.0
     elif age < min_age:
@@ -532,37 +538,30 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     # 5. مطابقة الخبرة (Range Logic + Original Model Compatibility)
     exp_candidate = clamp_number(candidate.years_of_experience if candidate.years_of_experience is not None else 0, 0.0, 60.0, 0.0)
     
-    # لحساب الـ Experience Match Score (بالـ Ranges)
     experience_match_score = calculate_experience_match_score(int(exp_candidate), job_post.experience_level or "Entry")
     
-    # لحساب الـ exp_diff للـ Model (زي الأصل)
     min_exp, max_exp = parse_experience_requirement(job_post.experience_level or "Entry")
     exp_required_legacy = experience_level_to_years(job_post.experience_level or "Entry")
     exp_diff = clamp_number(exp_candidate - exp_required_legacy, -60.0, 60.0, 0.0)
 
-    loc_score = location_match_score(candidate.address or "", job_post.location or "")
-    location_bonus = 0.03 * loc_score
-
-    # 6. التنبؤ باستخدام النموذج
+    # 6. التنبؤ باستخدام النموذج (Features زي التدريب بالضبط!)
     selected_title = job_post.title
     mapped_title = TECH_JOB_MAPPING.get(selected_title, selected_title)
     job_cat = TRAINED_JOB_CATEGORIES.index(mapped_title) if mapped_title in TRAINED_JOB_CATEGORIES else 23
 
     features = np.array([[
-        semantic_sim, skill_ratio, title_match_ratio, 
-        float(age), float(exp_candidate), 
+        semantic_sim,
+        skill_ratio,
+        title_match,  # Binary, زي التدريب!
+        float(age),
+        float(exp_candidate),
         float(exp_diff),
-        float(clamp_number(age - (min_age + max_age)/2, -80.0, 80.0, 0.0)),
+        float(age - age_requirement),  # زي التدريب!
         float(job_cat)
     ]])
     
     model_score = model.predict(features)[0]
-
-    # بونص صغير لـ job title match
-    title_bonus = 0.05 if title_match_ratio > 0.6 else 0.0  # 5% bonus if title matches more than 60%
-    
-    final_score_raw = model_score + title_bonus
-    final_pct = max(0, min(100.0, final_score_raw * 100))
+    final_pct = max(0, min(100.0, model_score * 100))
 
     return {
         "final_score": final_pct,
