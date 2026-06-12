@@ -92,6 +92,8 @@ class MatchScoreResponse(BaseModel):
     semantic_similarity: float
     age_match_score: float
     experience_match_score: float
+    title_bonus: float
+    location_bonus: float
 
 class RankedApplicant(BaseModel):
     rank: int
@@ -544,6 +546,8 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     exp_required_legacy = experience_level_to_years(job_post.experience_level or "Entry")
     exp_diff = clamp_number(exp_candidate - exp_required_legacy, -60.0, 60.0, 0.0)
 
+    loc_score = location_match_score(candidate.address or "", job_post.location or "")
+
     # 6. التنبؤ باستخدام النموذج (Features زي التدريب بالضبط!)
     selected_title = job_post.title
     mapped_title = TECH_JOB_MAPPING.get(selected_title, selected_title)
@@ -561,7 +565,17 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     ]])
     
     model_score = model.predict(features)[0]
-    final_pct = max(0, min(100.0, model_score * 100))
+
+    # --- Add reasonable manual bonuses/penalties
+    # Small title match bonus (max +7% if perfect title match
+    title_bonus = 0.07 if title_match_ratio == 1.0 else 0.0
+
+    # Location match bonus (max +5% if addresses match
+    loc_bonus = 0.05 if loc_score > 0.5 else 0.0
+
+    final_score_raw = model_score + title_bonus + loc_bonus
+
+    final_pct = max(0, min(100.0, final_score_raw * 100))
 
     return {
         "final_score": final_pct,
@@ -570,7 +584,9 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         "title_match_ratio": title_match_ratio,
         "semantic_similarity": semantic_sim,
         "age_match_score": age_match_score,
-        "experience_match_score": experience_match_score
+        "experience_match_score": experience_match_score,
+        "title_bonus": title_bonus * 100,
+        "location_bonus": loc_bonus * 100
     }
 
 # --- نقاط النهاية (Endpoints) ---
