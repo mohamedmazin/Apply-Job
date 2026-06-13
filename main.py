@@ -87,7 +87,6 @@ class JobPostData(BaseModel):
 class MatchScoreResponse(BaseModel):
     final_score: float
     model_score: float
-    scaled_model_score: float
     skill_match_ratio: float
     title_match_ratio: float
     semantic_similarity: float
