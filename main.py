@@ -493,9 +493,12 @@ def load_models():
 def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     model, sbert_model = load_models()
     
-    # 1. التشابه الدلالي (SBERT)
-    job_text = deep_clean_text(job_post.title + " " + (job_post.description or "") + " " + (job_post.required_skills or ""))
-    cv_text_combined = deep_clean_text((candidate.skills_extracted or "") + " " + (candidate.education_details_extracted or "") + " " + (candidate.full_text or ""))
+    # --- 1. SEMANTIC SIMILARITY (EXACTLY MATCH TRAINING SCRIPT!)
+    # Training script uses:
+    # resume = positions + skills
+    # job = education_requirements + skills_required
+    job_text = deep_clean_text(job_post.description or "" + " " + (job_post.required_skills or ""))
+    cv_text_combined = deep_clean_text((candidate.skills_extracted or "") + " " + (candidate.education_details_extracted or ""))
     
     cv_emb = sbert_model.encode(cv_text_combined, convert_to_tensor=True)
     job_emb = sbert_model.encode(job_text, convert_to_tensor=True)
@@ -537,7 +540,8 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
     else:
         age_diff = age - age_requirement
 
-    age_match_score = 1.0 if min_age <= age <= max_age else (max(0, 1 - (min_age - age)/10) if age < min_age else max(0, 1 - (age - max_age)/10))
+    # --- FIX: Syntax error here!
+    age_match_score = 1.0 if min_age <= age <= max_age else 0.0
 
     # 5. مطابقة الخبرة (Range Logic + Original Model Compatibility)
     exp_candidate = clamp_number(candidate.years_of_experience if candidate.years_of_experience is not None else 0, 0.0, 60.0, 0.0)
@@ -555,10 +559,8 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
 
     loc_score = location_match_score(candidate.address or "", job_post.location or "")
 
-    # 6. التنبؤ باستخدام النموذج (Features زي التدريب بالضبط!)
-    selected_title = job_post.title
-    mapped_title = TECH_JOB_MAPPING.get(selected_title, selected_title)
-    job_cat = TRAINED_JOB_CATEGORIES.index(mapped_title) if mapped_title in TRAINED_JOB_CATEGORIES else 23
+    # --- 6. Set job_cat=0 temporarily for TESTING!
+    job_cat = 0
 
     features = np.array([[
         semantic_sim,
@@ -571,24 +573,33 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
         float(job_cat)
     ]])
     
+    # --- DEBUG PRINT: Print all features!
+    print("\n=== FEATURES SENT TO MODEL ===")
+    print({
+        "semantic": semantic_sim,
+        "skill": skill_ratio,
+        "title": title_match,
+        "age": age,
+        "exp": exp_candidate,
+        "exp_diff": exp_diff,
+        "age_diff": age_diff,
+        "job_cat": job_cat
+    })
+    print("===============================\n")
+    
     model_score = model.predict(features)[0]
 
-    # --- Slightly scale model score to give a boost (make it more "optimistic")
-    # Scale from [0, 1] to [0.05, 0.98] then add 8 points, then clamp!
-    scaled_model_score = (model_score * 0.93) + 0.07
+    # --- Just small bonuses!
+    title_bonus = 0.06 if title_match_ratio == 1.0 else 0.0
+    loc_bonus = 0.04 if loc_score > 0.5 else 0.0
 
-    # --- Add reasonable manual bonuses/penalties
-    title_bonus = 0.15 if title_match_ratio == 1.0 else 0.0
-    loc_bonus = 0.05 if loc_score > 0.5 else 0.0
-
-    final_score_raw = scaled_model_score + title_bonus + loc_bonus
+    final_score_raw = model_score + title_bonus + loc_bonus
 
     final_pct = max(0, min(100.0, final_score_raw * 100))
 
     return {
         "final_score": final_pct,
         "model_score": model_score * 100,
-        "scaled_model_score": scaled_model_score * 100,
         "skill_match_ratio": skill_ratio,
         "title_match_ratio": title_match_ratio,
         "semantic_similarity": semantic_sim,
