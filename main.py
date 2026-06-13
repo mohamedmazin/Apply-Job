@@ -505,10 +505,15 @@ def calculate_match_score(candidate: CandidateData, job_post: JobPostData):
 
     # 2. مطابقة الكلمات المفتاحية للعنوان (Binary 0 or 1 زي التدريب)
     target_role = job_post.title.lower()
-    clean_title = re.sub(r'[\(\)/]', ' ', target_role)
+    # Clean title: remove / ( ) _ -, replace with space!
+    clean_title = re.sub(r'[\(\)/_\-]', ' ', target_role)
     title_keywords = [w for w in clean_title.split() if len(w) > 2 and w not in ["and", "the", "for"]]
     
-    title_match_count = sum(1 for kw in title_keywords if kw in (candidate.full_text or "").lower() or kw in (candidate.skills_extracted or "").lower())
+    # Clean candidate text too!
+    candidate_full_lower = re.sub(r'[\(\)/_\-]', ' ', (candidate.full_text or "").lower())
+    candidate_skills_lower = re.sub(r'[\(\)/_\-]', ' ', (candidate.skills_extracted or "").lower())
+    
+    title_match_count = sum(1 for kw in title_keywords if kw in candidate_full_lower or kw in candidate_skills_lower)
     title_match_ratio = title_match_count / len(title_keywords) if title_keywords else 1.0
     title_match_ratio = clamp_number(title_match_ratio, 0.0, 1.0, 0.0)
     title_match = 1.0 if title_match_ratio >= 0.5 else 0.0
