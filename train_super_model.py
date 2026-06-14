@@ -119,7 +119,22 @@ features = ['semantic_sim', 'skill_match_ratio', 'title_match', 'age', 'experien
 X = df[features].astype(float)
 y = df['matched_score']
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# --------------------------
+# FIX CLASS IMBALANCE: Calculate Sample Weights
+# --------------------------
+# First, classify each sample as "match" (>=0.5) or "non-match" (<0.5)
+y_class = (y >= 0.5).astype(int)
+# Calculate class weights inversely proportional to class frequencies
+class_counts = y_class.value_counts()
+total_samples = len(y_class)
+weight_0 = total_samples / (2 * class_counts.get(0, 1))  # weight for non-match
+weight_1 = total_samples / (2 * class_counts.get(1, 1))  # weight for match
+sample_weights = np.where(y_class == 0, weight_0, weight_1)
+print(f"Class counts: {class_counts.to_dict()}")
+print(f"Sample weights: non-match = {weight_0:.2f}, match = {weight_1:.2f}")
+# --------------------------
+
+X_train, X_test, y_train, y_test, sw_train, sw_test = train_test_split(X, y, sample_weights, test_size=0.2, random_state=42)
 
 print("Training Stacking Ensemble (XGBoost + LightGBM + CatBoost)...")
 
@@ -139,7 +154,7 @@ stacking_model = StackingRegressor(
     final_estimator=RidgeCV()
 )
 
-stacking_model.fit(X_train, y_train)
+stacking_model.fit(X_train, y_train, sample_weight=sw_train)
 
 y_pred = stacking_model.predict(X_test)
 r2 = r2_score(y_test, y_pred)
